@@ -1296,6 +1296,23 @@ padding:1px 7px;margin-top:6px;}
 .tag.val{background:rgba(63,185,80,.15);color:var(--good);}
 .tag.conf{background:rgba(76,154,255,.13);color:var(--accent);}
 @media(max-width:640px){.top-grid{grid-template-columns:1fr;}}
+.ranklist{max-width:1100px;margin:0 auto 22px;background:var(--card);
+border:1px solid var(--line);border-radius:12px;padding:8px 16px 14px;}
+.ranklist summary{cursor:pointer;font-size:13px;font-weight:700;padding:6px 0;}
+.rank-toggle{display:flex;gap:8px;margin:6px 0 10px;}
+.rank-toggle button{background:var(--card2);color:var(--muted);border:1px solid var(--line);
+border-radius:7px;padding:5px 12px;font-size:12px;font-weight:600;cursor:pointer;}
+.rank-toggle button.active{color:var(--bg);background:var(--accent);border-color:var(--accent);}
+.rank-scroll{overflow-x:auto;}
+table.ranktable{width:100%;border-collapse:collapse;font-size:12px;}
+table.ranktable th{color:var(--muted);font-weight:600;text-align:left;padding:5px 8px;border-bottom:1px solid var(--line);}
+table.ranktable td{padding:5px 8px;border-bottom:1px solid rgba(255,255,255,.03);}
+table.ranktable tr{cursor:pointer;}
+table.ranktable tr:hover td{background:rgba(76,154,255,.06);}
+.ranktable .r-num{color:var(--muted);width:38px;}
+.ranktable .r-pick{font-weight:700;white-space:nowrap;}
+.ranktable .r-match{color:var(--muted);white-space:nowrap;}
+.ranktable .r-val{color:var(--good);font-weight:700;}
 .role{display:inline-block;font-size:8px;font-weight:700;color:var(--bg);
 background:var(--accent);border-radius:4px;padding:1px 4px;margin-left:5px;vertical-align:middle;}
 td.st{color:var(--muted);white-space:nowrap;font-size:10px;}
@@ -1355,6 +1372,54 @@ def top_plays_html(metas, have_odds):
   </div>"""
 
 
+def ranked_table_html(metas, have_odds):
+    """Full sortable list of every game — toggle between confidence and edge."""
+    if not metas:
+        return ""
+    rows = ""
+    for m in metas:
+        edge = m["edge"]
+        edge_attr = edge if edge is not None else -999
+        ml = m["market_ml"]
+        ml_txt = (f"{'+' if (ml or 0) > 0 else ''}{ml}") if ml is not None else "—"
+        edge_cell = (f"{edge:+.1f}%" if edge is not None else "—")
+        odds_cells = (f'<td>{esc(ml_txt)}</td>'
+                      f'<td class="{"r-val" if m["has_value"] else ""}">{edge_cell}</td>'
+                      if have_odds else "")
+        rows += (f'<tr data-conf="{m["conf"]:.4f}" data-edge="{edge_attr}" '
+                 f'onclick="location.hash=\'#game-{m["gid"]}\'">'
+                 f'<td class="r-num"></td><td class="r-pick">{esc(m["pick"])}</td>'
+                 f'<td class="r-match">{esc(m["away"])} @ {esc(m["home"])}</td>'
+                 f'<td>{m["pick_pct"]}%</td>{odds_cells}</tr>')
+    edge_hdr = "<th>ML</th><th>Edge</th>" if have_odds else ""
+    edge_btn = ('<button id="btn-edge" onclick="sortPlays(\'edge\')">By edge</button>'
+                if have_odds else "")
+    default = "edge" if have_odds else "conf"
+    return f"""
+  <details class="ranklist" open>
+    <summary>Full ranked list — all {len(metas)} games</summary>
+    <div class="rank-toggle">
+      <button id="btn-conf" onclick="sortPlays('conf')">By confidence</button>
+      {edge_btn}
+    </div>
+    <div class="rank-scroll"><table class="ranktable">
+      <thead><tr><th>#</th><th>Pick</th><th>Matchup</th><th>Win%</th>{edge_hdr}</tr></thead>
+      <tbody id="rank-body">{rows}</tbody></table></div>
+    <script>
+      function sortPlays(key){{
+        var tb=document.getElementById('rank-body');
+        var rows=Array.prototype.slice.call(tb.querySelectorAll('tr'));
+        rows.sort(function(a,b){{return parseFloat(b.dataset[key])-parseFloat(a.dataset[key]);}});
+        rows.forEach(function(r,i){{r.querySelector('.r-num').textContent='#'+(i+1);tb.appendChild(r);}});
+        var bs=document.querySelectorAll('.rank-toggle button');
+        for(var i=0;i<bs.length;i++)bs[i].classList.remove('active');
+        var el=document.getElementById('btn-'+key); if(el) el.classList.add('active');
+      }}
+      sortPlays('{default}');
+    </script>
+  </details>"""
+
+
 def build_html(games, records, team_stats, day, pitchers, bvp_map, bullpens,
                league, hand_splits, recency, odds_map):
     if not games:
@@ -1366,8 +1431,10 @@ def build_html(games, records, team_stats, day, pitchers, bvp_map, bullpens,
                                    bullpens, league, hand_splits, recency, odds_map)
             cards.append(card)
             metas.append(meta)
-        top = top_plays_html(metas, bool(odds_map))
-        body = top + '<div class="games">\n' + "\n".join(cards) + "\n</div>"
+        have_odds = bool(odds_map)
+        top = top_plays_html(metas, have_odds)
+        ranked = ranked_table_html(metas, have_odds)
+        body = top + ranked + '<div class="games">\n' + "\n".join(cards) + "\n</div>"
 
     pretty = datetime.strptime(day, "%Y-%m-%d").strftime("%A, %B %-d, %Y")
     legend = (
