@@ -14,13 +14,14 @@ Then it reports win-probability calibration/accuracy (Brier, log loss,
 calibration table, vs. sensible baselines) and run-total error (MAE/RMSE/bias).
 
 Honest limitations (documented on purpose):
-  - Handedness splits and Statcast xERA are NOT reconstructable point-in-time
-    from the free endpoints, so the backtest uses as-of-date OVERALL wOBA and
-    an ERA+computed-FIP talent blend. The live site adds handedness + xERA on
-    top; those refinements are therefore not credited/penalized here.
-  - Bullpen fatigue is not reconstructed historically; the backtest treats
-    each team's relievers as equally available (quality only). Live adds
-    availability weighting.
+  - Handedness splits and Statcast xERA/K%/BB% are NOT reconstructable
+    point-in-time from the free endpoints, so the backtest uses as-of-date
+    OVERALL wOBA and an ERA+computed-FIP talent blend. The live site adds
+    handedness + Statcast peripherals on top.
+  - Bullpen fatigue IS reconstructed here: recent pitch counts are harvested
+    from the box scores of the six days before each game, so the model's
+    availability x usage weighting is applied exactly as it is live (talent is
+    the reduced FIP-based estimate noted above).
   This keeps every evaluated signal strictly pre-game and reproducible.
 
 Usage:
@@ -91,6 +92,8 @@ def asof_stats(cutoff):
                 "ip": model.ip_to_float(st.get("inningsPitched")),
                 "gs": model._num(st, "gamesStarted"),
                 "gp": model._num(st, "gamesPitched"),
+                "sv": model._num(st, "saves"),
+                "hld": model._num(st, "holds"),
             }
 
     off = {}
@@ -124,7 +127,8 @@ def asof_stats(cutoff):
     lg_era = sum(eras) / len(eras) if eras else 4.15
     lg_r = (sum(o["rspg"] for o in off.values()) / len(off)) if off else 4.4
 
-    # Precompute each team's bullpen talent (relievers, equal availability).
+    # Precompute each team's bullpen: talent + role (for expected usage).
+    # Availability is applied per-game from reconstructed recent usage.
     pen_by_team = {}
     for pid, p in pit.items():
         tid = p["team"]
@@ -133,12 +137,77 @@ def asof_stats(cutoff):
         if p["gp"] > 0 and p["gs"] / p["gp"] >= 0.5:
             continue  # starter
         talent = model.pitcher_true_talent(p["era"], p["fip"], None, None, lg_era)
-        pen_by_team.setdefault(tid, []).append({"talent": talent, "rank": 1})
+        role = ("CL" if p["sv"] >= 8 else "SU" if p["hld"] >= 8
+                else "SW" if p["gs"] >= 3 else "RP")
+        pen_by_team.setdefault(tid, []).append(
+            {"pid": pid, "talent": talent, "role": role})
 
     store = {"pit": pit, "off": off, "deff": deff, "pen": pen_by_team,
              "lg_woba": lg_woba, "lg_era": lg_era, "lg_r": lg_r}
     _asof_cache[cutoff] = store
     return store
+
+
+# --- Point-in-time reliever fatigue (reconstructed from box scores) -----------
+
+_box_cache = {}     # gamePk -> (date, {pid: pitches})
+_sched_cache = {}   # (start, end) -> [(gamePk, date), ...]
+
+
+def _final_games(start, end):
+    key = (start, end)
+    if key in _sched_cache:
+        return _sched_cache[key]
+    d = get_json(f"{STATS}/schedule?sportId=1&startDate={start}&endDate={end}")
+    pk_dates = []
+    if d:
+        for dd in d.get("dates", []):
+            for g in dd.get("games", []):
+                if g.get("status", {}).get("abstractGameState") == "Final":
+                    pk_dates.append((g["gamePk"], dd["date"]))
+    _sched_cache[key] = pk_dates
+    return pk_dates
+
+
+def _box_pitch_counts(pk_date):
+    pk, dstr = pk_date
+    if pk in _box_cache:
+        return pk, _box_cache[pk]
+    b = get_json(f"{STATS}/game/{pk}/boxscore")
+    counts = {}
+    if b:
+        for side in ("home", "away"):
+            tm = b.get("teams", {}).get(side, {})
+            for pid in tm.get("pitchers", []):
+                st = (tm.get("players", {}).get(f"ID{pid}", {})
+                      .get("stats", {}).get("pitching", {}))
+                np = st.get("numberOfPitches")
+                if np:
+                    counts[pid] = counts.get(pid, 0) + float(np)
+    _box_cache[pk] = (dstr, counts)
+    return pk, (dstr, counts)
+
+
+_usage_cache = {}
+
+
+def recent_usage_asof(game_day, lookback=6):
+    """{pid: {date: pitches}} over the `lookback` days before game_day."""
+    if game_day in _usage_cache:
+        return _usage_cache[game_day]
+    start = (game_day - timedelta(days=lookback)).isoformat()
+    end = (game_day - timedelta(days=1)).isoformat()
+    pk_dates = _final_games(start, end)
+    usage = {}
+    if pk_dates:
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            for pk, (dstr, counts) in ex.map(_box_pitch_counts, pk_dates):
+                d = datetime.strptime(dstr, "%Y-%m-%d").date()
+                for pid, np in counts.items():
+                    usage.setdefault(pid, {})
+                    usage[pid][d] = usage[pid].get(d, 0) + np
+    _usage_cache[game_day] = usage
+    return usage
 
 
 def games_on(day_str):
@@ -166,7 +235,7 @@ def games_on(day_str):
     return out
 
 
-def build_side(team_id, sp_id, store):
+def build_side(team_id, sp_id, store, usage, game_day):
     p = store["pit"].get(sp_id) if sp_id else None
     lg_era = store["lg_era"]
     if p:
@@ -174,7 +243,15 @@ def build_side(team_id, sp_id, store):
         proj_ip = model._project_ip(p["ip"], p["gs"], model.DEFAULT_CFG)
     else:
         sp_ra, proj_ip = lg_era + 0.25, 4.5
-    pen_ra = model.bullpen_run_prevention(store["pen"].get(team_id, []), lg_era)
+
+    # Bullpen: talent x (reconstructed availability) x (role-based usage).
+    arms = []
+    for a in store["pen"].get(team_id, []):
+        avail = model.availability_from_usage(usage.get(a["pid"], {}), game_day)
+        arms.append({"talent": a["talent"], "avail": avail,
+                     "usage": model.usage_weight(a["role"])})
+    pen_ra = model.bullpen_run_prevention(arms, lg_era)
+
     off = store["off"].get(team_id, {})
     deff = store["deff"].get(team_id, {})
     return {
@@ -184,9 +261,9 @@ def build_side(team_id, sp_id, store):
     }
 
 
-def predict_historical(game, store, cfg=None):
-    home = build_side(game["home_id"], game["home_sp"], store)
-    away = build_side(game["away_id"], game["away_sp"], store)
+def predict_historical(game, store, usage, game_day, cfg=None):
+    home = build_side(game["home_id"], game["home_sp"], store, usage, game_day)
+    away = build_side(game["away_id"], game["away_sp"], store, usage, game_day)
     ctx = {"lg_r": store["lg_r"],
            "park_factor": model.park_factor(game["home_id"])}
     return model.predict(home, away, ctx, cfg)
@@ -291,9 +368,9 @@ th{{color:#8b949e}} .k{{color:#8b949e}} .big{{font-size:19px;font-weight:700}}
 </div>
 <div class=card><b>Calibration</b> — if calibrated, pred≈actual in each bucket
 <table><tr><th>Predicted bucket</th><th>n</th><th>Model</th><th>Actual</th></tr>{rows}</table></div>
-<p class=k>Point-in-time reconstruction via StatsAPI byDateRange. Handedness &
-Statcast xERA and bullpen fatigue are live-only refinements not reconstructed
-here. Analysis only, not betting advice.</p>
+<p class=k>Point-in-time reconstruction via StatsAPI byDateRange + box-score
+recent-usage. Bullpen availability×usage IS reconstructed; handedness splits and
+Statcast peripherals are live-only. Analysis only, not betting advice.</p>
 </body></html>"""
     with open(path, "w") as f:
         f.write(html)
@@ -325,8 +402,9 @@ def main():
             continue
         cutoff = d - timedelta(days=1)   # stats as of the day BEFORE
         store = asof_stats(cutoff)
+        usage = recent_usage_asof(d)     # reconstructed reliever fatigue
         for g in gs:
-            pred = predict_historical(g, store)
+            pred = predict_historical(g, store, usage, d)
             home_win = 1 if g["home_score"] > g["away_score"] else 0
             actual_total = g["home_score"] + g["away_score"]
             rows.append((pred["p_home_raw"], home_win,

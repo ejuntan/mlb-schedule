@@ -18,6 +18,7 @@ it as-of-date features and reproduce exactly what the live app would have shown.
 """
 
 import math
+from datetime import timedelta
 
 # --- League run-scoring park factors (100 = neutral), keyed by home team id ---
 # Approximate multi-year run park factors. Coors is the extreme outlier; pitcher
@@ -251,6 +252,21 @@ def availability_score(p1, p2, p3, app3, rest):
         a *= 0.85
 
     return max(0.05, min(1.0, a))
+
+
+def availability_from_usage(byday, game_day):
+    """
+    availability_score() from a {date: pitches} history, relative to game_day.
+    Shared by the live site and the backtest so availability is identical.
+    """
+    if not byday:
+        return availability_score(0, 0, 0, 0, None)
+    last = max(byday)
+    rest = (game_day - last).days
+    d1, d2, d3 = (game_day - timedelta(days=n) for n in (1, 2, 3))
+    p1, p2, p3d = byday.get(d1, 0), byday.get(d2, 0), byday.get(d3, 0)
+    app3 = sum(1 for d in (d1, d2, d3) if d in byday)
+    return availability_score(p1, p2, p1 + p2 + p3d, app3, rest)
 
 
 # --- EXPECTED USAGE: share of the game's relief innings this arm covers -----
