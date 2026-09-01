@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+mlb_schedule_*.html
+.venv/
+venv/
+.DS_Store

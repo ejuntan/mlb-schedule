@@ -1,0 +1,16 @@
+# Render.com blueprint — deploy with one click via "New + > Blueprint".
+services:
+  - type: web
+    name: mlb-schedule
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 1 --threads 4 --timeout 120 --bind 0.0.0.0:$PORT
+    healthCheckPath: /healthz
+    envVars:
+      - key: MLB_REFRESH_SECONDS
+        value: "900"
+      - key: MLB_CACHE_TTL
+        value: "600"
+      - key: PYTHON_VERSION
+        value: "3.12.5"
