@@ -611,16 +611,24 @@ def fetch_recent_usage(day_str, lookback=6):
 
 
 def fatigue_for(byday, game_day):
-    """Turn a {date: pitches} history into a fatigue status + rest metrics."""
+    """Turn a {date: pitches} history into fatigue status + workload metrics.
+
+    Exposes the raw availability inputs the model needs: pitches 1/2/3 days ago,
+    appearances in the last 3 days, and days since last appearance.
+    """
     if not byday:
-        return {"dot": "🟢", "label": "Fresh (no recent app)", "rest": "5+",
-                "p3": "0", "app3": "0", "rank": 0}
+        base = {"dot": "🟢", "label": "Fresh (no recent app)", "rest": "5+",
+                "p1": 0, "p2": 0, "p3": 0, "app3": 0, "rest_n": None, "rank": 0}
+        base["avail"] = model.availability_score(0, 0, 0, 0, None)
+        return base
     last = max(byday)
     days_rest = (game_day - last).days
     d1, d2, d3 = (game_day - timedelta(days=n) for n in (1, 2, 3))
-    p_yest = byday.get(d1, 0)
+    p1 = byday.get(d1, 0)
+    p2 = byday.get(d2, 0)
+    p3d = byday.get(d3, 0)
+    p3 = p1 + p2 + p3d
     app3 = sum(1 for d in (d1, d2, d3) if d in byday)
-    p3 = sum(byday.get(d, 0) for d in (d1, d2, d3))
     b2b = (d1 in byday) and (d2 in byday)
 
     if days_rest <= 0:
@@ -629,7 +637,7 @@ def fatigue_for(byday, game_day):
         dot, label, rank = "🔴", "3 apps in 3 days", 4
     elif b2b:
         dot, label, rank = "🟠", "Back-to-back", 3
-    elif days_rest == 1 and p_yest >= 35:
+    elif days_rest == 1 and p1 >= 35:
         dot, label, rank = "🟠", "35+ P yesterday", 3
     elif days_rest == 1:
         dot, label, rank = "🟡", "Threw yesterday", 2
@@ -637,11 +645,20 @@ def fatigue_for(byday, game_day):
         dot, label, rank = "🟢", f"{days_rest}d rest", 1
 
     return {"dot": dot, "label": label, "rest": str(days_rest),
-            "p3": sig3(p3), "app3": str(app3), "rank": rank}
+            "p1": p1, "p2": p2, "p3": p3, "app3": app3, "rest_n": days_rest,
+            "avail": model.availability_score(p1, p2, p3, app3, days_rest),
+            "rank": rank}
 
 
-def build_bullpen(team_id, exclude_pid, pitcher_ids, bulk, usage, savant_c, game_day):
-    """Assemble a sorted list of available relievers with stats + fatigue."""
+def build_bullpen(team_id, exclude_pid, pitcher_ids, bulk, usage,
+                  savant_c, savant_x, game_day):
+    """Assemble a sorted list of available relievers with stats + fatigue.
+
+    Each reliever carries the raw inputs for the bullpen model:
+      talent  <- FIP, xFIP, xERA, K%, BB%
+      avail   <- pitches 1/2/3 days ago, appearances 3d, days rest
+      usage   <- role-based expected share of relief innings
+    """
     pen = []
     for pid in pitcher_ids:
         if pid == exclude_pid:
@@ -658,17 +675,21 @@ def build_bullpen(team_id, exclude_pid, pitcher_ids, bulk, usage, savant_c, game
         role = "CL" if sv >= 8 else "SU" if hld >= 8 else "SW" if gs >= 3 else "RP"
         fat = fatigue_for(usage.get(pid, {}), game_day)
         sc = savant_c.get(str(pid), {})
+        sx = savant_x.get(str(pid), {})
         pen.append({
             "name": st.get("_name") or "—", "role": role,
             "era": sig3(st.get("era")), "whip": sig3(st.get("whip")),
             "k9": sig3(st.get("strikeoutsPer9Inn")), "ip": sig3(st.get("inningsPitched")),
             "sv": int(sv), "hld": int(hld), "leverage": sv + hld,
             "fip": sig3(st.get("fip")), "xfip": sig3(st.get("xfip")),
-            "k_pct": sc.get("k_pct", "—"), "whiff_pct": sc.get("whiff_pct", "—"),
+            "xera": sig3(sx.get("xera")),
+            "k_pct": sc.get("k_pct", "—"), "bb_pct": sc.get("bb_pct", "—"),
+            "whiff_pct": sc.get("whiff_pct", "—"),
+            "usage": model.usage_weight(role),
             "fat": fat,
         })
-    # Rested/available arms first, then higher-leverage (closer/setup) first.
-    pen.sort(key=lambda x: (x["fat"]["rank"], -x["leverage"]))
+    # Most-available arms first, then higher expected usage.
+    pen.sort(key=lambda x: (-x["fat"]["avail"], -x["usage"]))
     return pen
 
 
@@ -721,9 +742,13 @@ def build_features(rec, pitcher, pen, hand_split, opp_hand, lg):
     else:
         sp_ra, proj_ip = lg_era + 0.25, 4.5
 
-    arms = [{"talent": model.pitcher_true_talent(r["era"], r["fip"], r["xfip"],
-                                                 None, lg_era),
-             "rank": r["fat"]["rank"]} for r in (pen or [])]
+    # Bullpen: talent (FIP/xFIP/xERA/K%/BB%) x availability x expected usage.
+    arms = [{
+        "talent": model.reliever_true_talent(r["fip"], r["xfip"], r["xera"],
+                                             r["k_pct"], r["bb_pct"], lg_era),
+        "avail": r["fat"]["avail"],
+        "usage": r.get("usage", 1.0),
+    } for r in (pen or [])]
     pen_ra = model.bullpen_run_prevention(arms, lg_era)
 
     return {"off_woba": off_woba, "lg_off_woba": lg_off_woba,
@@ -893,9 +918,10 @@ def bullpen_html(pen, team_name):
         f"<tr><td class='bn'>{r['fat']['dot']} {esc(r['name'])}"
         f"<span class='role'>{esc(r['role'])}</span></td>"
         f"<td class='st'>{esc(r['fat']['label'])}</td>"
+        f"<td>{round(r['fat']['avail']*100)}%</td>"
         f"<td>{esc(r['fat']['p3'])}</td><td>{esc(r['fat']['app3'])}</td>"
-        f"<td>{esc(r['era'])}</td><td>{esc(r['whip'])}</td><td>{esc(r['k9'])}</td>"
-        f"<td>{esc(r['fip'])}</td><td>{esc(r['k_pct'])}</td><td>{esc(r['whiff_pct'])}</td></tr>"
+        f"<td>{esc(r['era'])}</td><td>{esc(r['fip'])}</td><td>{esc(r['xfip'])}</td>"
+        f"<td>{esc(r['xera'])}</td><td>{esc(r['k_pct'])}</td><td>{esc(r['bb_pct'])}</td></tr>"
         for r in pen
     )
     return f"""
@@ -904,8 +930,8 @@ def bullpen_html(pen, team_name):
       <div class="pen-sum">{summary}</div>
       <div class="pen-scroll">
       <table class="mini">
-        <tr><th>Reliever</th><th>Status</th><th>P·3d</th><th>App·3d</th>
-            <th>ERA</th><th>WHIP</th><th>K/9</th><th>FIP</th><th>K%</th><th>Whiff%</th></tr>
+        <tr><th>Reliever</th><th>Status</th><th>Avail</th><th>P·3d</th><th>App·3d</th>
+            <th>ERA</th><th>FIP</th><th>xFIP</th><th>xERA</th><th>K%</th><th>BB%</th></tr>
         {rows}
       </table>
       </div>
@@ -1260,7 +1286,7 @@ def generate_page(day, force=False):
     for tid in team_ids:
         bullpens[tid] = build_bullpen(
             tid, team_starter.get(tid), roster_pitchers.get(tid, []),
-            bulk, usage, savant_c, game_day)
+            bulk, usage, savant_c, savant_x, game_day)
     print(f"      {sum(len(v) for v in bullpens.values())} relievers across "
           f"{len(bullpens)} teams; usage from {len(usage)} pitchers.")
 

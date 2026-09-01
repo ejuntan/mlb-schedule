@@ -173,24 +173,110 @@ def _blend(pairs, default):
 
 
 def pitcher_true_talent(era, fip, xfip, xera, lg_era):
-    """Run-prevention talent per 9, weighting predictive (expected) metrics more."""
+    """Run-prevention talent per 9, weighting predictive (expected) metrics more.
+    Used for STARTERS (which carry xERA and full metrics)."""
     return _blend([(era, 0.20), (fip, 0.30), (xfip, 0.25), (xera, 0.25)], lg_era)
+
+
+# --- Reliever TRUE TALENT: FIP + xFIP + xERA + K% + BB% --------------------
+LG_KBB = 0.135  # league-average K% minus BB% (~13.5%)
+
+
+def _kbb_fraction(k_pct, bb_pct):
+    try:
+        return (float(k_pct) - float(bb_pct)) / 100.0
+    except (TypeError, ValueError):
+        return None
+
+
+def reliever_true_talent(fip, xfip, xera, k_pct, bb_pct, lg_era):
+    """
+    Run-prevention talent (per 9) for a reliever, from run-scale metrics
+    (xERA/FIP/xFIP) plus a modest peripheral nudge from K%-BB%. All five inputs
+    contribute; missing ones drop out of the blend gracefully.
+    """
+    base = _blend([(xera, 0.34), (fip, 0.34), (xfip, 0.32)], lg_era)
+    kbb = _kbb_fraction(k_pct, bb_pct)
+    if kbb is not None:
+        # Better-than-league K-BB% lowers the run estimate; softened to avoid
+        # double-counting what FIP/xFIP already embed.
+        base += -4.0 * (kbb - LG_KBB)
+    return base
+
+
+# --- AVAILABILITY: a continuous 0..1 factor from recent workload ------------
+
+def availability_score(p1, p2, p3, app3, rest):
+    """
+    p1/p2/p3 = pitches thrown 1/2/3 days ago; app3 = appearances in last 3 days;
+    rest = days since last appearance (None if no recent work).
+    Returns a 0..1 readiness factor: fresh arms ~1.0, heavily-worked arms ~0.1.
+    """
+    p1 = p1 or 0
+    p2 = p2 or 0
+    p3d = p3 or 0
+    app3 = app3 or 0
+
+    if rest is None or rest >= 4:
+        a = 1.0
+    elif rest >= 3:
+        a = 0.95
+    elif rest == 2:
+        a = 0.85
+    elif rest == 1:
+        # scaled by how hard they worked yesterday
+        if p1 >= 40:
+            a = 0.20
+        elif p1 >= 30:
+            a = 0.35
+        elif p1 >= 20:
+            a = 0.55
+        elif p1 >= 10:
+            a = 0.72
+        else:
+            a = 0.85
+    else:  # rest == 0 (already pitched today)
+        a = 0.10
+
+    # Consecutive-day penalties.
+    if app3 >= 3:
+        a = min(a, 0.20)                    # 3 appearances in 3 days -> likely down
+    elif app3 >= 2 and rest is not None and rest <= 1 and p2 > 0:
+        a *= 0.75                           # recent back-to-back
+
+    # Cumulative 3-day pitch load.
+    if p3d >= 55:
+        a *= 0.70
+    elif p3d >= 40:
+        a *= 0.85
+
+    return max(0.05, min(1.0, a))
+
+
+# --- EXPECTED USAGE: share of the game's relief innings this arm covers -----
+USAGE_WEIGHT = {"CL": 1.25, "SU": 1.15, "RP": 1.0, "SW": 0.85}
+
+
+def usage_weight(role):
+    return USAGE_WEIGHT.get(role, 1.0)
 
 
 def bullpen_run_prevention(arms, lg_era):
     """
-    arms: list of {"talent": ra_per9, "rank": fatigue_rank}. Returns the
-    AVAILABILITY-WEIGHTED average QUALITY of the pen (quality x availability),
-    with no saves/holds involved.
+    Bullpen run-prevention = average reliever TRUE TALENT weighted by
+    AVAILABILITY x EXPECTED USAGE.
+
+        arms: list of {"talent": ra_per9, "avail": 0..1, "usage": >0}
+    (avail/usage default to 1.0 so simpler callers still work.)
     """
     if not arms:
         return lg_era + 0.20
     num = den = 0.0
     for a in arms:
-        w = FAT_WEIGHT.get(a.get("rank", 0), 0.5)
         t = a.get("talent")
         if t is None:
             continue
+        w = a.get("avail", 1.0) * a.get("usage", 1.0)
         num += t * w
         den += w
     return num / den if den else lg_era + 0.20
