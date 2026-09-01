@@ -6,3 +6,4 @@ venv/
 .DS_Store
 backtest*.html
 predictions_cache.json
+bet_report.html
