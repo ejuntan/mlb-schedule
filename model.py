@@ -173,6 +173,28 @@ def _blend(pairs, default):
     return num / den if den else default
 
 
+def regress(val, n, k, lg):
+    """Regress a rate `val` (over sample size `n`) toward league `lg` by `k`."""
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return lg
+    n = n or 0
+    return (v * n + lg * k) / (n + k) if (n + k) > 0 else lg
+
+
+def recency_blend(season_val, season_n, recent_val, recent_n, lg, k, w_recent=0.4):
+    """
+    Blend a season estimate with a recent-form estimate, each regressed to the
+    league mean by its own sample. Recent form gets weight `w_recent`.
+    """
+    s = regress(season_val, season_n, k, lg)
+    if recent_val is None or not recent_n:
+        return s
+    r = regress(recent_val, recent_n, k, lg)
+    return (1 - w_recent) * s + w_recent * r
+
+
 def pitcher_true_talent(era, fip, xfip, xera, lg_era):
     """Run-prevention talent per 9, weighting predictive (expected) metrics more.
     Used for STARTERS (which carry xERA and full metrics)."""

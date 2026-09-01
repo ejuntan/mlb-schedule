@@ -76,41 +76,49 @@ def asof_stats(cutoff):
     start = season_start(season)
     end = cutoff.isoformat()
 
-    pit = {}
-    d = get_json(f"{STATS}/stats?stats=byDateRange&group=pitching&sportId=1"
-                 f"&startDate={start}&endDate={end}&playerPool=all&limit=3000")
-    if d and d.get("stats"):
-        for s in d["stats"][0].get("splits", []):
-            pid = s.get("player", {}).get("id")
-            st = s.get("stat", {})
-            if pid is None:
-                continue
-            pit[pid] = {
-                "team": s.get("team", {}).get("id"),
-                "era": st.get("era"),
-                "fip": model.calc_fip(st),
-                "ip": model.ip_to_float(st.get("inningsPitched")),
-                "gs": model._num(st, "gamesStarted"),
-                "gp": model._num(st, "gamesPitched"),
-                "sv": model._num(st, "saves"),
-                "hld": model._num(st, "holds"),
-            }
+    recent_start = (cutoff - timedelta(days=30)).isoformat()
 
-    off = {}
-    d = get_json(f"{STATS}/teams/stats?stats=byDateRange&group=hitting&sportId=1"
-                 f"&startDate={start}&endDate={end}")
-    lg_agg = {}
-    if d and d.get("stats"):
-        for s in d["stats"][0].get("splits", []):
-            tid = s.get("team", {}).get("id")
-            st = s.get("stat", {})
-            g = model._num(st, "gamesPlayed") or 1
-            off[tid] = {"woba": model.calc_woba(st),
-                        "rspg": model._num(st, "runs") / g}
-            for k in ("atBats", "hits", "doubles", "triples", "homeRuns",
-                      "baseOnBalls", "intentionalWalks", "hitByPitch", "sacFlies"):
-                lg_agg[k] = lg_agg.get(k, 0) + model._num(st, k)
-    lg_woba = model.calc_woba(lg_agg) or 0.315
+    def pitching(sd, ed):
+        out = {}
+        d = get_json(f"{STATS}/stats?stats=byDateRange&group=pitching&sportId=1"
+                     f"&startDate={sd}&endDate={ed}&playerPool=all&limit=3000")
+        if d and d.get("stats"):
+            for s in d["stats"][0].get("splits", []):
+                pid = s.get("player", {}).get("id")
+                st = s.get("stat", {})
+                if pid is None:
+                    continue
+                out[pid] = {
+                    "team": s.get("team", {}).get("id"),
+                    "era": st.get("era"), "fip": model.calc_fip(st),
+                    "ip": model.ip_to_float(st.get("inningsPitched")),
+                    "gs": model._num(st, "gamesStarted"),
+                    "gp": model._num(st, "gamesPitched"),
+                    "sv": model._num(st, "saves"), "hld": model._num(st, "holds"),
+                }
+        return out
+
+    pit = pitching(start, end)                 # season-to-date
+    pit30 = pitching(recent_start, end)        # last 30 days
+
+    def hitting(sd, ed):
+        out = {}
+        d = get_json(f"{STATS}/teams/stats?stats=byDateRange&group=hitting"
+                     f"&sportId=1&startDate={sd}&endDate={ed}")
+        if d and d.get("stats"):
+            for s in d["stats"][0].get("splits", []):
+                tid = s.get("team", {}).get("id")
+                st = s.get("stat", {})
+                g = model._num(st, "gamesPlayed") or 1
+                out[tid] = {"woba": model.calc_woba(st),
+                            "pa": model._num(st, "plateAppearances"),
+                            "rspg": model._num(st, "runs") / g}
+        return out
+
+    off = hitting(start, end)
+    off30 = hitting(recent_start, end)
+    lg_woba = (sum(o["woba"] for o in off.values() if o["woba"])
+               / max(1, sum(1 for o in off.values() if o["woba"]))) or 0.315
 
     deff = {}
     d = get_json(f"{STATS}/teams/stats?stats=byDateRange&group=pitching&sportId=1"
@@ -127,8 +135,25 @@ def asof_stats(cutoff):
     lg_era = sum(eras) / len(eras) if eras else 4.15
     lg_r = (sum(o["rspg"] for o in off.values()) / len(off)) if off else 4.4
 
-    # Precompute each team's bullpen: talent + role (for expected usage).
-    # Availability is applied per-game from reconstructed recent usage.
+    # Recency-weighted, regressed TALENT per pitcher (season blended with L30).
+    K_IP = 40
+    for pid, p in pit.items():
+        p30 = pit30.get(pid, {})
+        season_t = model.pitcher_true_talent(p["era"], p["fip"], None, None, lg_era)
+        recent_t = (model.pitcher_true_talent(p30.get("era"), p30.get("fip"),
+                                              None, None, lg_era)
+                    if p30.get("ip") else None)
+        p["talent"] = model.recency_blend(season_t, p["ip"], recent_t,
+                                          p30.get("ip"), lg_era, K_IP)
+
+    # Recency-weighted, regressed wOBA per team.
+    K_PA = 170
+    for tid, o in off.items():
+        o30 = off30.get(tid, {})
+        o["woba_reg"] = model.recency_blend(o["woba"], o["pa"], o30.get("woba"),
+                                            o30.get("pa"), lg_woba, K_PA)
+
+    # Bullpen: regressed talent + role (for expected usage).
     pen_by_team = {}
     for pid, p in pit.items():
         tid = p["team"]
@@ -136,11 +161,10 @@ def asof_stats(cutoff):
             continue
         if p["gp"] > 0 and p["gs"] / p["gp"] >= 0.5:
             continue  # starter
-        talent = model.pitcher_true_talent(p["era"], p["fip"], None, None, lg_era)
         role = ("CL" if p["sv"] >= 8 else "SU" if p["hld"] >= 8
                 else "SW" if p["gs"] >= 3 else "RP")
         pen_by_team.setdefault(tid, []).append(
-            {"pid": pid, "talent": talent, "role": role})
+            {"pid": pid, "talent": p["talent"], "role": role})
 
     store = {"pit": pit, "off": off, "deff": deff, "pen": pen_by_team,
              "lg_woba": lg_woba, "lg_era": lg_era, "lg_r": lg_r}
@@ -239,7 +263,7 @@ def build_side(team_id, sp_id, store, usage, game_day):
     p = store["pit"].get(sp_id) if sp_id else None
     lg_era = store["lg_era"]
     if p:
-        sp_ra = model.pitcher_true_talent(p["era"], p["fip"], None, None, lg_era)
+        sp_ra = p.get("talent") or (lg_era + 0.25)
         proj_ip = model._project_ip(p["ip"], p["gs"], model.DEFAULT_CFG)
     else:
         sp_ra, proj_ip = lg_era + 0.25, 4.5
@@ -255,7 +279,8 @@ def build_side(team_id, sp_id, store, usage, game_day):
     off = store["off"].get(team_id, {})
     deff = store["deff"].get(team_id, {})
     return {
-        "off_woba": off.get("woba"), "lg_off_woba": store["lg_woba"],
+        "off_woba": off.get("woba_reg") or off.get("woba"),
+        "lg_off_woba": store["lg_woba"],
         "sp_ra": sp_ra, "proj_ip": proj_ip, "pen_ra": pen_ra,
         "rspg": off.get("rspg"), "rapg": deff.get("rapg"),
     }
@@ -303,9 +328,26 @@ def evaluate(rows):
         rmse = math.sqrt(sum((e - a) ** 2 for e, a in tot_rows) / len(tot_rows))
         bias = sum(e - a for e, a in tot_rows) / len(tot_rows)
 
+    # --- Flat 1-unit betting on the model's pick (higher win prob) ---------
+    # No market odds are available from StatsAPI, so we report unit results
+    # under two ASSUMED payouts. These are NOT real moneyline P/L (favorites
+    # actually cost more than +1 to win); they measure the picks in unit terms.
+    wins = picks_right
+    losses = n - wins
+    pay_110 = 100 / 110  # standard -110 vig: risk 1 to win 0.909
+    bet = {
+        "bets": n, "wins": wins, "losses": losses,
+        "win_pct": wins / n,
+        "units_even": wins - losses,
+        "roi_even": (wins - losses) / n,
+        "units_110": wins * pay_110 - losses,
+        "roi_110": (wins * pay_110 - losses) / n,
+        "breakeven_110": 110 / 210,  # 52.38%
+    }
+
     return {
         "n": n, "acc": acc, "brier": brier, "logloss": logloss,
-        "home_win_rate": home_win_rate,
+        "home_win_rate": home_win_rate, "bet": bet,
         "brier_baseline_50": 0.25,
         "brier_baseline_homerate": home_win_rate * (1 - home_win_rate),
         "acc_baseline_home": max(home_win_rate, 1 - home_win_rate),

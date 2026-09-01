@@ -50,6 +50,7 @@ calls. Threads handle concurrent requests fine.
 | `PORT` | 8000 | Port to bind |
 | `MLB_CACHE_TTL` | 600 | Seconds a built date stays cached |
 | `MLB_REFRESH_SECONDS` | 900 | How often the background thread rebuilds *today* |
+| `ODDS_API_KEY` | *(unset)* | A free key from the-odds-api.com. When set, each game shows the live moneyline, the model's edge vs the market, and a ✓ VALUE flag. Unset = the odds row simply doesn't render. |
 
 ---
 
@@ -121,9 +122,22 @@ runs per team come from:
   *available* arms (no saves/holds as a quality proxy).
 - **Park factors** — Coors vs Oracle are not the same run environment.
 
+- **Recency + regression** — starter, bullpen, and offense inputs blend
+  season-to-date with the **last 30 days**, each regressed to the league mean by
+  sample size (so small samples don't swing the projection).
+
 Team run totals are then drawn from a **negative-binomial distribution**
 (overdispersed, matching real MLB scoring) and the win probability is the
 P(home runs > away runs) over the joint distribution, with a home-field bump.
+
+### Live odds & value (optional, `odds.py`)
+
+Set `ODDS_API_KEY` (free tier from the-odds-api.com) and each game card adds a
+row: the current moneyline, the market's de-vigged implied probability, the
+model's probability, the **edge**, and a **✓ VALUE** flag when the model's
+number beats the market's. With no key the row is simply omitted. Backtesting
+shows value-only + line-shopping is the only variant that reached roughly
+break-even against closing lines — see `bet_backtest.py`. Not betting advice.
 
 ## Backtest (`backtest.py`)
 

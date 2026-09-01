@@ -51,6 +51,7 @@ from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 
 import model  # shared prediction model (also used by backtest.py)
+import odds   # optional live odds / value layer (dormant without ODDS_API_KEY)
 
 STATS = "https://statsapi.mlb.com/api/v1"
 SAVANT = "https://baseballsavant.mlb.com"
@@ -291,6 +292,64 @@ def fetch_team_hand_splits(season, team_ids):
     league = {"R": model.calc_woba(agg["R"]) or 0.315,
               "L": model.calc_woba(agg["L"]) or 0.315}
     return splits, league
+
+
+# ---------------------------------------------------------------------------
+# Recency (last-30-day) inputs, blended + regressed in the prediction model
+# ---------------------------------------------------------------------------
+
+def fetch_recent_pitching(day):
+    """{pid: {era, fip, ip}} over the 30 days before `day` (starters + pen)."""
+    gd = datetime.strptime(day, "%Y-%m-%d").date()
+    sd = (gd - timedelta(days=30)).isoformat()
+    ed = (gd - timedelta(days=1)).isoformat()
+    out = {}
+    d = get_json(f"{STATS}/stats?stats=byDateRange&group=pitching&sportId={SPORT_ID}"
+                 f"&startDate={sd}&endDate={ed}&playerPool=all&limit=3000")
+    if d and d.get("stats"):
+        for s in d["stats"][0].get("splits", []):
+            pid = s.get("player", {}).get("id")
+            if pid is None:
+                continue
+            st = s.get("stat", {})
+            out[pid] = {"era": st.get("era"), "fip": model.calc_fip(st),
+                        "ip": model.ip_to_float(st.get("inningsPitched"))}
+    return out
+
+
+def fetch_offense_recency(day, season):
+    """
+    Per-team offense recency multiplier: (season+L30 regressed wOBA) / season wOBA,
+    clamped. Applied to the handedness split so recent form nudges the projection.
+    """
+    gd = datetime.strptime(day, "%Y-%m-%d").date()
+    ed = (gd - timedelta(days=1)).isoformat()
+
+    def hit(sd):
+        d = get_json(f"{STATS}/teams/stats?stats=byDateRange&group=hitting"
+                     f"&sportId={SPORT_ID}&startDate={sd}&endDate={ed}")
+        out = {}
+        if d and d.get("stats"):
+            for s in d["stats"][0].get("splits", []):
+                tid = s.get("team", {}).get("id")
+                st = s.get("stat", {})
+                out[tid] = (model.calc_woba(st), model._num(st, "plateAppearances"))
+        return out
+
+    season_h = hit(f"{season}-03-01")
+    l30_h = hit((gd - timedelta(days=30)).isoformat())
+    wobas = [w for w, _ in season_h.values() if w]
+    lg_woba = sum(wobas) / len(wobas) if wobas else 0.315
+
+    factors = {}
+    for tid, (w_s, pa_s) in season_h.items():
+        if not w_s:
+            factors[tid] = 1.0
+            continue
+        w30, pa30 = l30_h.get(tid, (None, 0))
+        blended = model.recency_blend(w_s, pa_s, w30, pa30, lg_woba, 170)
+        factors[tid] = max(0.9, min(1.1, blended / w_s))
+    return factors
 
 
 # ---------------------------------------------------------------------------
@@ -677,6 +736,7 @@ def build_bullpen(team_id, exclude_pid, pitcher_ids, bulk, usage,
         sc = savant_c.get(str(pid), {})
         sx = savant_x.get(str(pid), {})
         pen.append({
+            "pid": pid,
             "name": st.get("_name") or "—", "role": role,
             "era": sig3(st.get("era")), "whip": sig3(st.get("whip")),
             "k9": sig3(st.get("strikeoutsPer9Inn")), "ip": sig3(st.get("inningsPitched")),
@@ -724,31 +784,51 @@ def _season_run_env(rec):
     return None, None
 
 
-def build_features(rec, pitcher, pen, hand_split, opp_hand, lg):
-    """Assemble one team's feature dict for model.predict()."""
+def build_features(rec, pitcher, sp_pid, pen, hand_split, opp_hand, lg,
+                   team_id, recency):
+    """Assemble one team's feature dict for model.predict().
+
+    `recency` = {"pit": {pid:{era,fip,ip}} last 30d, "off": {tid: factor}}.
+    Starter and reliever talent blend season with last-30-day form (regressed);
+    offense wOBA is nudged by the team's recent-form multiplier.
+    """
     lg_era = lg["ERA"]
     opp_hand = opp_hand if opp_hand in ("R", "L") else "R"
+    rpit = (recency or {}).get("pit", {})
+    K_IP = 40
 
     off = (hand_split or {}).get(opp_hand, {})
-    off_woba = off.get("woba")
+    base_woba = off.get("woba")
+    factor = (recency or {}).get("off", {}).get(team_id, 1.0)
+    off_woba = base_woba * factor if base_woba else None
     lg_off_woba = (lg.get("woba") or {}).get(opp_hand)
 
     rspg, rapg = _season_run_env(rec)
 
     if pitcher:
-        sp_ra = model.pitcher_true_talent(pitcher["era"], pitcher["fip"],
-                                          pitcher["xfip"], pitcher["xera"], lg_era)
+        season_t = model.pitcher_true_talent(pitcher["era"], pitcher["fip"],
+                                             pitcher["xfip"], pitcher["xera"], lg_era)
+        rp = rpit.get(sp_pid)
+        recent_t = (model.pitcher_true_talent(rp["era"], rp["fip"], None, None, lg_era)
+                    if rp else None)
+        sp_ra = model.recency_blend(season_t, model.ip_to_float(pitcher["ip"]),
+                                    recent_t, rp["ip"] if rp else 0, lg_era, K_IP)
         proj_ip = model._project_ip(pitcher["ip"], pitcher["gs"], model.DEFAULT_CFG)
     else:
         sp_ra, proj_ip = lg_era + 0.25, 4.5
 
-    # Bullpen: talent (FIP/xFIP/xERA/K%/BB%) x availability x expected usage.
-    arms = [{
-        "talent": model.reliever_true_talent(r["fip"], r["xfip"], r["xera"],
-                                             r["k_pct"], r["bb_pct"], lg_era),
-        "avail": r["fat"]["avail"],
-        "usage": r.get("usage", 1.0),
-    } for r in (pen or [])]
+    # Bullpen: season+L30 talent x availability x expected usage.
+    arms = []
+    for r in (pen or []):
+        season_t = model.reliever_true_talent(r["fip"], r["xfip"], r["xera"],
+                                              r["k_pct"], r["bb_pct"], lg_era)
+        rp = rpit.get(r.get("pid"))
+        recent_t = (model.pitcher_true_talent(rp["era"], rp["fip"], None, None, lg_era)
+                    if rp else None)
+        talent = model.recency_blend(season_t, model.ip_to_float(r["ip"]),
+                                     recent_t, rp["ip"] if rp else 0, lg_era, K_IP)
+        arms.append({"talent": talent, "avail": r["fat"]["avail"],
+                     "usage": r.get("usage", 1.0)})
     pen_ra = model.bullpen_run_prevention(arms, lg_era)
 
     return {"off_woba": off_woba, "lg_off_woba": lg_off_woba,
@@ -945,6 +1025,22 @@ def prediction_html(pred, drv, away_name, home_name):
     fav_pct = max(pred["p_home"], pred["p_away"])
     pf = pred["park_factor"]
     pf_txt = f"{pf} ({'hitter' if pf > 102 else 'pitcher' if pf < 98 else 'neutral'})"
+    o = pred.get("odds")
+    odds_html = ""
+    if o:
+        side = home_name if o["pick_home"] else away_name
+        ml = o["home_ml"] if o["pick_home"] else o["away_ml"]
+        ml_txt = f"{'+' if (ml or 0) > 0 else ''}{ml}"
+        badge = (f'<span class="val-yes">✓ VALUE +{o["edge_pct"]}%</span>'
+                 if o["value"] else
+                 f'<span class="val-no">no edge ({o["edge_pct"]}%)</span>')
+        odds_html = f"""
+      <div class="pred-odds">
+        Market: {esc(away_name)} {esc(o['away_ml'])} / {esc(o['home_ml'])} {esc(home_name)}
+        &nbsp;·&nbsp; model {o['model_home_pct']}% vs market {o['market_home_pct']}% (home)
+        &nbsp;·&nbsp; pick {esc(side)} {esc(ml_txt)} {badge}
+        <span class="pred-note"> · {o['books']} books · analysis only, not betting advice</span>
+      </div>"""
     return f"""
     <div class="predict">
       <div class="pred-head">🔮 Model projection
@@ -960,12 +1056,13 @@ def prediction_html(pred, drv, away_name, home_name):
         &nbsp;·&nbsp; Starter R/9: {esc(drv['away_sp'])} vs {esc(drv['home_sp'])} (~{esc(drv['away_ip'])}/{esc(drv['home_ip'])} IP)
         &nbsp;·&nbsp; Pen R/9: {esc(drv['away_pen'])} vs {esc(drv['home_pen'])}
       </div>
-      <div class="pred-note">Negative-binomial run model — handedness offense, starter+bullpen (quality×availability), park factor. Analysis only, not betting advice.</div>
+      {odds_html}
+      <div class="pred-note">Negative-binomial run model — recency-weighted handedness offense, starter+bullpen (quality×availability), park factor. Analysis only, not betting advice.</div>
     </div>"""
 
 
 def game_card(game, records, team_stats, pitchers, bvp_map, bullpens, league,
-              hand_splits):
+              hand_splits, recency, odds_map):
     teams = game.get("teams", {})
     home_t = teams.get("home", {}).get("team", {})
     away_t = teams.get("away", {}).get("team", {})
@@ -1010,12 +1107,16 @@ def game_card(game, records, team_stats, pitchers, bvp_map, bullpens, league,
     home_hand = (home_pitcher or {}).get("hand") or "R"   # home SP hand
     away_hand = (away_pitcher or {}).get("hand") or "R"   # away SP hand
     # Home offense faces the AWAY starter's hand; away offense faces HOME's.
-    home_feat = build_features(rec_for("home", home_id), home_pitcher, home_pen,
-                               hand_splits.get(home_id), away_hand, league)
-    away_feat = build_features(rec_for("away", away_id), away_pitcher, away_pen,
-                               hand_splits.get(away_id), home_hand, league)
+    home_feat = build_features(rec_for("home", home_id), home_pitcher, home_pid,
+                               home_pen, hand_splits.get(home_id), away_hand,
+                               league, home_id, recency)
+    away_feat = build_features(rec_for("away", away_id), away_pitcher, away_pid,
+                               away_pen, hand_splits.get(away_id), home_hand,
+                               league, away_id, recency)
     ctx = {"lg_r": league["R"], "park_factor": model.park_factor(home_id)}
     pred = model.predict(home_feat, away_feat, ctx)
+    pred["odds"] = odds.evaluate(pred["p_home_raw"],
+                                 odds_map.get((home_id, away_id))) if odds_map else None
 
     def _woba_txt(feat):
         w = feat.get("off_woba")
@@ -1118,6 +1219,9 @@ justify-content:flex-end;padding:0 8px;white-space:nowrap;min-width:0;overflow:h
 .pred-nums{font-size:12px;margin-top:8px;}
 .pred-drivers{font-size:11px;color:var(--muted);margin-top:4px;}
 .pred-note{font-size:9px;color:var(--muted);margin-top:6px;font-style:italic;}
+.pred-odds{font-size:11px;margin-top:7px;padding-top:7px;border-top:1px dashed var(--line);}
+.val-yes{color:var(--good);font-weight:700;background:rgba(63,185,80,.12);border-radius:5px;padding:1px 6px;}
+.val-no{color:var(--muted);}
 .role{display:inline-block;font-size:8px;font-weight:700;color:var(--bg);
 background:var(--accent);border-radius:4px;padding:1px 4px;margin-left:5px;vertical-align:middle;}
 td.st{color:var(--muted);white-space:nowrap;font-size:10px;}
@@ -1134,13 +1238,13 @@ border:1px solid var(--line);border-radius:8px;padding:7px 12px;font-size:13px;}
 
 
 def build_html(games, records, team_stats, day, pitchers, bvp_map, bullpens,
-               league, hand_splits):
+               league, hand_splits, recency, odds_map):
     if not games:
         body = '<div class="empty">No MLB games scheduled for this date.</div>'
     else:
         body = '<div class="games">\n' + "\n".join(
             game_card(g, records, team_stats, pitchers, bvp_map, bullpens,
-                      league, hand_splits)
+                      league, hand_splits, recency, odds_map)
             for g in games
         ) + "\n</div>"
 
@@ -1309,11 +1413,18 @@ def generate_page(day, force=False):
     print("Handedness splits (team vs RHP/LHP wOBA) ...")
     hand_splits, lg_woba = fetch_team_hand_splits(season, team_ids)
 
+    print("Recency (last-30-day form) + live odds (if key set) ...")
+    recency = {"pit": fetch_recent_pitching(day),
+               "off": fetch_offense_recency(day, season)}
+    odds_map = odds.fetch_odds(day)
+    if odds_map:
+        print(f"      live odds for {len(odds_map)} games.")
+
     print("Building page ...")
     league = compute_league(records, team_stats)
     league["woba"] = lg_woba
     page = build_html(games, records, team_stats, day, pitchers, bvp_map,
-                      bullpens, league, hand_splits)
+                      bullpens, league, hand_splits, recency, odds_map)
     _PAGE_CACHE[day] = (time.time(), page)
     return page
 

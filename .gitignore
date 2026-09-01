@@ -5,3 +5,4 @@ mlb_schedule_*.html
 venv/
 .DS_Store
 backtest*.html
+predictions_cache.json
