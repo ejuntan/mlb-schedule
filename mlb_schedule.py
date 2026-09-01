@@ -1171,8 +1171,23 @@ def game_card(game, records, team_stats, pitchers, bvp_map, bullpens, league,
         "home_ip": round(home_feat["proj_ip"], 1), "away_ip": round(away_feat["proj_ip"], 1),
     }
 
-    return f"""
-  <div class="game">
+    # Pick metadata for the "Top plays" ranking.
+    gid = game.get("gamePk", id(game))
+    o = pred.get("odds")
+    meta = {
+        "gid": gid, "away": away_name, "home": home_name,
+        "pick": home_name if pred["fav_home"] else away_name,
+        "pick_pct": max(pred["p_home"], pred["p_away"]),
+        "conf": abs(pred["p_home_raw"] - 0.5),
+        "gametime": gametime,
+        "edge": (o["edge_pct"] if o else None),
+        "has_value": bool(o and o["value"]),
+        "market_ml": (o["home_ml"] if (o and o["pick_home"])
+                      else o["away_ml"] if o else None),
+    }
+
+    card = f"""
+  <div class="game" id="game-{gid}">
     <div class="matchup">
       {team_block("AWAY", away_name, rec_for('away', away_id), team_stats.get(away_id), away_id)}
       <div class="at">@</div>
@@ -1189,6 +1204,7 @@ def game_card(game, records, team_stats, pitchers, bvp_map, bullpens, league,
       <div class="pen-col"><div class="pen-team">{esc(home_name)} pen</div>{bullpen_html(home_pen, home_name)}</div>
     </div>
   </div>"""
+    return card, meta
 
 
 PAGE_CSS = """
@@ -1264,6 +1280,22 @@ justify-content:flex-end;padding:0 8px;white-space:nowrap;min-width:0;overflow:h
 .val-yes{color:var(--good);font-weight:700;background:rgba(63,185,80,.12);border-radius:5px;padding:1px 6px;}
 .val-no{color:var(--muted);}
 .fb-note{color:var(--accent2);font-size:10px;}
+.top{background:var(--card);border:1px solid var(--line);border-radius:12px;
+padding:14px 16px;margin:0 auto 22px;max-width:1100px;}
+.top h2{font-size:14px;margin:0 0 4px;letter-spacing:.02em;}
+.top .tsub{color:var(--muted);font-size:11px;margin-bottom:10px;}
+.top-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;}
+.play{background:var(--card2);border:1px solid var(--line);border-radius:9px;
+padding:10px 12px;text-decoration:none;color:var(--text);display:block;}
+.play:hover{border-color:var(--accent);}
+.play .rank{font-size:10px;color:var(--muted);}
+.play .pick{font-size:15px;font-weight:700;margin:2px 0;}
+.play .why{font-size:11px;color:var(--muted);}
+.play .tag{display:inline-block;font-size:10px;font-weight:700;border-radius:5px;
+padding:1px 7px;margin-top:6px;}
+.tag.val{background:rgba(63,185,80,.15);color:var(--good);}
+.tag.conf{background:rgba(76,154,255,.13);color:var(--accent);}
+@media(max-width:640px){.top-grid{grid-template-columns:1fr;}}
 .role{display:inline-block;font-size:8px;font-weight:700;color:var(--bg);
 background:var(--accent);border-radius:4px;padding:1px 4px;margin-left:5px;vertical-align:middle;}
 td.st{color:var(--muted);white-space:nowrap;font-size:10px;}
@@ -1279,16 +1311,63 @@ border:1px solid var(--line);border-radius:8px;padding:7px 12px;font-size:13px;}
 """
 
 
+def top_plays_html(metas, have_odds):
+    """Rank the day's games and render a Top-3 banner.
+
+    With odds: rank by market edge (value). Without: rank by model confidence.
+    """
+    if not metas:
+        return ""
+    if have_odds:
+        ranked = sorted([m for m in metas if m["edge"] is not None],
+                        key=lambda m: m["edge"], reverse=True)
+        basis = "biggest edge vs the market"
+    else:
+        ranked = sorted(metas, key=lambda m: m["conf"], reverse=True)
+        basis = "highest model confidence (no odds key set)"
+    top = ranked[:3]
+    if not top:
+        return ""
+    cards = ""
+    for i, m in enumerate(top, 1):
+        if have_odds and m["edge"] is not None:
+            ml = m["market_ml"]
+            ml_txt = f"{'+' if (ml or 0) > 0 else ''}{ml}" if ml is not None else ""
+            tag = (f'<span class="tag val">+{m["edge"]}% edge</span>'
+                   if m["has_value"] else
+                   f'<span class="tag conf">{m["edge"]}% vs mkt</span>')
+            why = f"model {m['pick_pct']}% · {ml_txt}"
+        else:
+            tag = f'<span class="tag conf">{m["pick_pct"]}% win prob</span>'
+            why = f"{esc(m['away'])} @ {esc(m['home'])} · {esc(m['gametime'])}"
+        cards += f"""
+      <a class="play" href="#game-{m['gid']}">
+        <div class="rank">#{i} pick</div>
+        <div class="pick">{esc(m['pick'])}</div>
+        <div class="why">{why}</div>
+        {tag}
+      </a>"""
+    return f"""
+  <div class="top">
+    <h2>⭐ Top 3 plays</h2>
+    <div class="tsub">Ranked by {esc(basis)}. Analysis only, not betting advice.</div>
+    <div class="top-grid">{cards}</div>
+  </div>"""
+
+
 def build_html(games, records, team_stats, day, pitchers, bvp_map, bullpens,
                league, hand_splits, recency, odds_map):
     if not games:
         body = '<div class="empty">No MLB games scheduled for this date.</div>'
     else:
-        body = '<div class="games">\n' + "\n".join(
-            game_card(g, records, team_stats, pitchers, bvp_map, bullpens,
-                      league, hand_splits, recency, odds_map)
-            for g in games
-        ) + "\n</div>"
+        cards, metas = [], []
+        for g in games:
+            card, meta = game_card(g, records, team_stats, pitchers, bvp_map,
+                                   bullpens, league, hand_splits, recency, odds_map)
+            cards.append(card)
+            metas.append(meta)
+        top = top_plays_html(metas, bool(odds_map))
+        body = top + '<div class="games">\n' + "\n".join(cards) + "\n</div>"
 
     pretty = datetime.strptime(day, "%Y-%m-%d").strftime("%A, %B %-d, %Y")
     legend = (
