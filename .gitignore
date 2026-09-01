@@ -4,3 +4,4 @@ mlb_schedule_*.html
 .venv/
 venv/
 .DS_Store
+backtest*.html

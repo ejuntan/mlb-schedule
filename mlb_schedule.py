@@ -50,6 +50,8 @@ from concurrent.futures import ThreadPoolExecutor
 from urllib.request import urlopen, Request
 from urllib.error import URLError, HTTPError
 
+import model  # shared prediction model (also used by backtest.py)
+
 STATS = "https://statsapi.mlb.com/api/v1"
 SAVANT = "https://baseballsavant.mlb.com"
 SPORT_ID = 1  # MLB
@@ -233,7 +235,62 @@ def fetch_team_stats(season):
         "team_era": "era", "team_whip": "whip", "team_so": "strikeOuts",
         "team_hr": "homeRuns", "team_sv": "saves",
     })
+    # Advanced hitting adds ISO (SLG-AVG) and BABIP context in one bulk call.
+    url = (f"{STATS}/teams/stats?season={season}&sportId={SPORT_ID}"
+           f"&group=hitting&stats=seasonAdvanced")
+    data = get_json(url)
+    if data and data.get("stats"):
+        for split in data["stats"][0].get("splits", []):
+            tid = split.get("team", {}).get("id")
+            if tid is not None:
+                out.setdefault(tid, {})
+                out[tid]["iso"] = split.get("stat", {}).get("iso", "—")
     return out
+
+
+def fetch_team_hand_splits(season, team_ids):
+    """
+    Per-team offense vs RHP / vs LHP as wOBA (+ OPS), plus league baselines.
+    Returns (splits, league) where:
+        splits[team_id] = {"R": {woba, ops}, "L": {woba, ops}}
+        league = {"R": lg_woba_vs_R, "L": lg_woba_vs_L}
+    'R'/'L' key the OPPOSING pitcher's throwing hand.
+    """
+    splits = {}
+    agg = {"R": {}, "L": {}}  # league aggregate counting stats by opp hand
+
+    def load(tid):
+        url = (f"{STATS}/teams/{tid}/stats?stats=statSplits&sitCodes=vr,vl"
+               f"&group=hitting&season={season}")
+        data = get_json(url)
+        res = {}
+        if data:
+            for s in data.get("stats", []):
+                for sp in s.get("splits", []):
+                    code = sp.get("split", {}).get("code")  # 'vr' or 'vl'
+                    hand = "R" if code == "vr" else "L" if code == "vl" else None
+                    if hand:
+                        res[hand] = sp.get("stat", {})
+        return tid, res
+
+    with ThreadPoolExecutor(max_workers=10) as ex:
+        for tid, res in ex.map(load, team_ids):
+            entry = {}
+            for hand in ("R", "L"):
+                st = res.get(hand, {})
+                entry[hand] = {
+                    "woba": model.calc_woba(st),
+                    "ops": st.get("ops"),
+                }
+                # accumulate league totals
+                for k in ("atBats", "hits", "doubles", "triples", "homeRuns",
+                          "baseOnBalls", "intentionalWalks", "hitByPitch", "sacFlies"):
+                    agg[hand][k] = agg[hand].get(k, 0) + model._num(st, k)
+            splits[tid] = entry
+
+    league = {"R": model.calc_woba(agg["R"]) or 0.315,
+              "L": model.calc_woba(agg["L"]) or 0.315}
+    return splits, league
 
 
 # ---------------------------------------------------------------------------
@@ -616,29 +673,16 @@ def build_bullpen(team_id, exclude_pid, pitcher_ids, bulk, usage, savant_c, game
 
 
 # ---------------------------------------------------------------------------
-# Prediction model (transparent heuristic built from the stats above)
+# Prediction model adapter — builds features and calls model.predict()
 # ---------------------------------------------------------------------------
 #
-# Approach (all data-driven from the same feeds shown on the card):
-#   1. Each team's run environment from the season: runs/game (RS) and
-#      runs allowed/game (RA).
-#   2. Starter run-prevention estimate = weighted blend of ERA/FIP/xFIP/xERA
-#      (the more predictive "expected" metrics carry more weight).
-#   3. Bullpen run-prevention estimate = ERA/FIP blend of the AVAILABLE arms,
-#      weighted by fatigue (rested arms count fully, gassed arms barely) and
-#      by leverage (closers/setup men count more).
-#   4. Game run-prevention = 60% starter + 40% bullpen, then blended 55/45
-#      with the team's season RA so it stays grounded in real results.
-#   5. Matchup expected runs via the Bill James "odds ratio":
-#          ExpRuns(A) = RS(A) * Def(B) / leagueRunsPerGame
-#      Home team gets a +0.18 run home-field bump.
-#   6. Win probability via the Pythagorean relation (exponent 1.83),
-#      clamped to [8%, 92%] to avoid overconfidence.
-#
-# This is an analytical estimate for context only — not betting advice.
-
-FAT_WEIGHT = {1: 1.0, 2: 0.72, 3: 0.42, 4: 0.15, 0: 1.0}
-
+# The math lives in model.py (shared with backtest.py). Here we translate the
+# page's data feeds into the feature dict the model expects:
+#   - handedness-adjusted offense (team wOBA vs the opposing starter's hand)
+#   - starter true talent (ERA/FIP/xFIP/xERA blend) + projected innings
+#   - bullpen quality x availability (fatigue-weighted true talent)
+#   - season run environment as a grounding fallback
+# Park factor and the negative-binomial run distribution are applied in model.
 
 def _f(x):
     try:
@@ -647,81 +691,53 @@ def _f(x):
         return None
 
 
-def _blend(vals_weights, default):
-    num = den = 0.0
-    for v, w in vals_weights:
-        fv = _f(v)
-        if fv is not None:
-            num += fv * w
-            den += w
-    return num / den if den else default
+def _season_run_env(rec):
+    """(runs/game, runs-allowed/game) from a standings record, or (None, None)."""
+    try:
+        w, l = (int(x) for x in str(rec.get("overall", "")).split("-"))
+        g = w + l
+        if g:
+            return (_f(rec.get("rs")) or 0) / g, (_f(rec.get("ra")) or 0) / g
+    except (ValueError, AttributeError):
+        pass
+    return None, None
 
 
-def _starter_ra(p, lg_era):
-    if not p:
-        return lg_era + 0.25  # unknown/TBD: slightly worse than average
-    return _blend([(p["era"], 0.20), (p["fip"], 0.30),
-                   (p["xfip"], 0.25), (p["xera"], 0.25)], lg_era)
+def build_features(rec, pitcher, pen, hand_split, opp_hand, lg):
+    """Assemble one team's feature dict for model.predict()."""
+    lg_era = lg["ERA"]
+    opp_hand = opp_hand if opp_hand in ("R", "L") else "R"
 
+    off = (hand_split or {}).get(opp_hand, {})
+    off_woba = off.get("woba")
+    lg_off_woba = (lg.get("woba") or {}).get(opp_hand)
 
-def _pen_ra(pen, lg_era):
-    if not pen:
-        return lg_era + 0.20
-    num = den = 0.0
-    for r in pen:
-        est = _blend([(r["era"], 0.5), (r["fip"], 0.5)], lg_era)
-        w = FAT_WEIGHT.get(r["fat"]["rank"], 0.5) * (1 + min(r["leverage"], 20) / 20.0)
-        num += est * w
-        den += w
-    return num / den if den else lg_era
+    rspg, rapg = _season_run_env(rec)
 
+    if pitcher:
+        sp_ra = model.pitcher_true_talent(pitcher["era"], pitcher["fip"],
+                                          pitcher["xfip"], pitcher["xera"], lg_era)
+        proj_ip = model._project_ip(pitcher["ip"], pitcher["gs"], model.DEFAULT_CFG)
+    else:
+        sp_ra, proj_ip = lg_era + 0.25, 4.5
 
-def predict_game(home, away, league):
-    """home/away = {rspg, rapg, sp, pen}. Returns win probs + projected runs."""
-    lg_r = league["R"] or 4.4
-    lg_era = league["ERA"] or 4.15
+    arms = [{"talent": model.pitcher_true_talent(r["era"], r["fip"], r["xfip"],
+                                                 None, lg_era),
+             "rank": r["fat"]["rank"]} for r in (pen or [])]
+    pen_ra = model.bullpen_run_prevention(arms, lg_era)
 
-    for side in (home, away):
-        side["sp_ra"] = _starter_ra(side.get("sp"), lg_era)
-        side["pen_ra"] = _pen_ra(side.get("pen", []), lg_era)
-
-    def def_rating(s):
-        pitch = 0.6 * s["sp_ra"] + 0.4 * s["pen_ra"]
-        return 0.55 * pitch + 0.45 * (s.get("rapg") or lg_r)
-
-    def exp_runs(off, opp):
-        return max(1.5, (off.get("rspg") or lg_r) * def_rating(opp) / lg_r)
-
-    e_home = exp_runs(home, away) + 0.18   # home-field
-    e_away = exp_runs(away, home)
-    ph = e_home ** 1.83 / (e_home ** 1.83 + e_away ** 1.83)
-    ph = min(0.92, max(0.08, ph))
-
-    gap = abs(ph - 0.5)
-    conf = ("Toss-up" if gap < 0.06 else "Lean" if gap < 0.14
-            else "Edge" if gap < 0.24 else "Strong")
-    fav_home = ph >= 0.5
-    return {
-        "p_home": round(ph * 100), "p_away": round((1 - ph) * 100),
-        "e_home": round(e_home, 1), "e_away": round(e_away, 1),
-        "conf": conf, "fav_home": fav_home,
-        "home_sp_ra": round(home["sp_ra"], 2), "away_sp_ra": round(away["sp_ra"], 2),
-        "home_pen_ra": round(home["pen_ra"], 2), "away_pen_ra": round(away["pen_ra"], 2),
-    }
+    return {"off_woba": off_woba, "lg_off_woba": lg_off_woba,
+            "sp_ra": sp_ra, "proj_ip": proj_ip, "pen_ra": pen_ra,
+            "rspg": rspg, "rapg": rapg, "off_ops": off.get("ops")}
 
 
 def compute_league(records, team_stats):
     """League runs/game and ERA baselines from all teams' season data."""
     rspg = []
     for r in records.values():
-        try:
-            w, l = (int(x) for x in str(r.get("overall", "")).split("-"))
-        except ValueError:
-            continue
-        g = w + l
-        rs = _f(r.get("rs"))
-        if g and rs is not None:
-            rspg.append(rs / g)
+        rs_pg, _ = _season_run_env(r)
+        if rs_pg:
+            rspg.append(rs_pg)
     eras = [v for v in (_f(t.get("team_era")) for t in team_stats.values())
             if v is not None]
     lg_r = sum(rspg) / len(rspg) if rspg else 4.4
@@ -896,11 +912,13 @@ def bullpen_html(pen, team_name):
     </details>"""
 
 
-def prediction_html(pred, away_name, home_name):
+def prediction_html(pred, drv, away_name, home_name):
     if not pred:
         return ""
     fav = home_name if pred["fav_home"] else away_name
     fav_pct = max(pred["p_home"], pred["p_away"])
+    pf = pred["park_factor"]
+    pf_txt = f"{pf} ({'hitter' if pf > 102 else 'pitcher' if pf < 98 else 'neutral'})"
     return f"""
     <div class="predict">
       <div class="pred-head">🔮 Model projection
@@ -910,16 +928,18 @@ def prediction_html(pred, away_name, home_name):
         <div class="pb-home" style="width:{pred['p_home']}%">{pred['p_home']}% {esc(home_name)}</div>
       </div>
       <div class="pred-nums">Projected runs: {esc(away_name)} <b>{pred['e_away']}</b> &ndash; <b>{pred['e_home']}</b> {esc(home_name)}
-        &nbsp;·&nbsp; total {esc(sig3(pred['e_away'] + pred['e_home']))}</div>
+        &nbsp;·&nbsp; total <b>{pred['exp_total']}</b> &nbsp;·&nbsp; park {esc(pf_txt)}</div>
       <div class="pred-drivers">
-        Starter R/9 est: {esc(away_name)} {pred['away_sp_ra']} vs {pred['home_sp_ra']} {esc(home_name)}
-        &nbsp;·&nbsp; Bullpen R/9 est: {pred['away_pen_ra']} vs {pred['home_pen_ra']}
+        Offense (wOBA vs {esc(drv['away_hand'])}HP/{esc(drv['home_hand'])}HP): {esc(away_name)} {esc(drv['away_woba'])} vs {esc(drv['home_woba'])} {esc(home_name)}
+        &nbsp;·&nbsp; Starter R/9: {esc(drv['away_sp'])} vs {esc(drv['home_sp'])} (~{esc(drv['away_ip'])}/{esc(drv['home_ip'])} IP)
+        &nbsp;·&nbsp; Pen R/9: {esc(drv['away_pen'])} vs {esc(drv['home_pen'])}
       </div>
-      <div class="pred-note">Heuristic estimate from the stats on this card — for analysis only, not betting advice.</div>
+      <div class="pred-note">Negative-binomial run model — handedness offense, starter+bullpen (quality×availability), park factor. Analysis only, not betting advice.</div>
     </div>"""
 
 
-def game_card(game, records, team_stats, pitchers, bvp_map, bullpens, league):
+def game_card(game, records, team_stats, pitchers, bvp_map, bullpens, league,
+              hand_splits):
     teams = game.get("teams", {})
     home_t = teams.get("home", {}).get("team", {})
     away_t = teams.get("away", {}).get("team", {})
@@ -960,22 +980,28 @@ def game_card(game, records, team_stats, pitchers, bvp_map, bullpens, league):
     away_pen = bullpens.get(away_id, [])
     home_pen = bullpens.get(home_id, [])
 
-    # Prediction inputs (season run environment per team + starter + pen).
-    def side(rec, pitcher, pen):
-        rspg = rapg = None
-        try:
-            w, l = (int(x) for x in str(rec.get("overall", "")).split("-"))
-            g = w + l
-            if g:
-                rspg = (_f(rec.get("rs")) or 0) / g
-                rapg = (_f(rec.get("ra")) or 0) / g
-        except (ValueError, AttributeError):
-            pass
-        return {"rspg": rspg, "rapg": rapg, "sp": pitcher, "pen": pen}
+    # Prediction: handedness offense vs opposing starter, starter+pen defense.
+    home_hand = (home_pitcher or {}).get("hand") or "R"   # home SP hand
+    away_hand = (away_pitcher or {}).get("hand") or "R"   # away SP hand
+    # Home offense faces the AWAY starter's hand; away offense faces HOME's.
+    home_feat = build_features(rec_for("home", home_id), home_pitcher, home_pen,
+                               hand_splits.get(home_id), away_hand, league)
+    away_feat = build_features(rec_for("away", away_id), away_pitcher, away_pen,
+                               hand_splits.get(away_id), home_hand, league)
+    ctx = {"lg_r": league["R"], "park_factor": model.park_factor(home_id)}
+    pred = model.predict(home_feat, away_feat, ctx)
 
-    away_side = side(rec_for("away", away_id), away_pitcher, away_pen)
-    home_side = side(rec_for("home", home_id), home_pitcher, home_pen)
-    pred = predict_game(home_side, away_side, league)
+    def _woba_txt(feat):
+        w = feat.get("off_woba")
+        return f"{w:.3f}".lstrip("0") if isinstance(w, float) else "—"
+
+    drv = {
+        "home_hand": esc(home_hand), "away_hand": esc(away_hand),
+        "home_woba": _woba_txt(home_feat), "away_woba": _woba_txt(away_feat),
+        "home_sp": round(home_feat["sp_ra"], 2), "away_sp": round(away_feat["sp_ra"], 2),
+        "home_pen": round(home_feat["pen_ra"], 2), "away_pen": round(away_feat["pen_ra"], 2),
+        "home_ip": round(home_feat["proj_ip"], 1), "away_ip": round(away_feat["proj_ip"], 1),
+    }
 
     return f"""
   <div class="game">
@@ -985,7 +1011,7 @@ def game_card(game, records, team_stats, pitchers, bvp_map, bullpens, league):
       {team_block("HOME", home_name, rec_for('home', home_id), team_stats.get(home_id), home_id)}
     </div>
     <div class="meta">{esc(gametime)} · {esc(venue)} · {esc(status)}{wx}</div>
-    {prediction_html(pred, away_name, home_name)}
+    {prediction_html(pred, drv, away_name, home_name)}
     <div class="pitchers">
       <div class="pitcher-col"><div class="col-label">Away probable</div>{pitcher_card(away_pitcher, away_bvp, home_name)}</div>
       <div class="pitcher-col"><div class="col-label">Home probable</div>{pitcher_card(home_pitcher, home_bvp, away_name)}</div>
@@ -1081,12 +1107,14 @@ border:1px solid var(--line);border-radius:8px;padding:7px 12px;font-size:13px;}
 """
 
 
-def build_html(games, records, team_stats, day, pitchers, bvp_map, bullpens, league):
+def build_html(games, records, team_stats, day, pitchers, bvp_map, bullpens,
+               league, hand_splits):
     if not games:
         body = '<div class="empty">No MLB games scheduled for this date.</div>'
     else:
         body = '<div class="games">\n' + "\n".join(
-            game_card(g, records, team_stats, pitchers, bvp_map, bullpens, league)
+            game_card(g, records, team_stats, pitchers, bvp_map, bullpens,
+                      league, hand_splits)
             for g in games
         ) + "\n</div>"
 
@@ -1252,10 +1280,14 @@ def generate_page(day, force=False):
         for pid, bvp in ex.map(load_bvp, list(pitcher_jobs.items())):
             bvp_map[pid] = bvp
 
+    print("Handedness splits (team vs RHP/LHP wOBA) ...")
+    hand_splits, lg_woba = fetch_team_hand_splits(season, team_ids)
+
     print("Building page ...")
     league = compute_league(records, team_stats)
+    league["woba"] = lg_woba
     page = build_html(games, records, team_stats, day, pitchers, bvp_map,
-                      bullpens, league)
+                      bullpens, league, hand_splits)
     _PAGE_CACHE[day] = (time.time(), page)
     return page
 

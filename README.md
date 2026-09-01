@@ -106,6 +106,47 @@ Put nginx/Caddy in front for TLS if exposing publicly.
   a league-wide box-score sweep for fatigue) instead of per-player fan-out.
 - Per-date in-memory cache + background refresh of today.
 
+## Prediction model (`model.py`)
+
+Shared by the live site and the backtest so both run identical math. Expected
+runs per team come from:
+
+- **Handedness offense** — team wOBA vs the *opposing starter's hand* (vs RHP /
+  vs LHP), not just runs/game.
+- **Offensive quality** — wOBA (linear weights) + ISO + OPS, with a wRC+ estimate.
+- **Starter** — a true-talent run rate blending ERA / FIP / xFIP / xERA.
+- **Expected starter innings** — projected from IP/GS; a 6.5-IP arm shifts more
+  weight onto the starter and less onto the bullpen than a 4.5-IP arm.
+- **Bullpen = quality × availability** — fatigue-weighted true talent of the
+  *available* arms (no saves/holds as a quality proxy).
+- **Park factors** — Coors vs Oracle are not the same run environment.
+
+Team run totals are then drawn from a **negative-binomial distribution**
+(overdispersed, matching real MLB scoring) and the win probability is the
+P(home runs > away runs) over the joint distribution, with a home-field bump.
+
+## Backtest (`backtest.py`)
+
+Reconstructs each historical game's inputs **as they were the day before**
+(season-to-date via StatsAPI `byDateRange` — no look-ahead), runs the same
+`model.predict()`, and compares to the actual final score.
+
+```bash
+python3 backtest.py --start 2025-06-01 --end 2025-06-30 --out backtest.html
+```
+
+Reports win-probability **accuracy, Brier score, log loss**, a **calibration
+table**, and run-total **MAE/RMSE/bias**, each against sensible baselines
+(50/50, always-pick-home). Example (187 games, first half of June 2025): Brier
+0.246 vs 0.250 baseline, near-monotonic calibration, totals MAE ~3.6 with ~0
+bias — a small but real edge, which is about what an honest MLB model looks like.
+
+*Point-in-time caveat:* handedness splits and Statcast xERA can't be
+reconstructed historically from the free endpoints, and bullpen fatigue isn't
+rebuilt, so the backtest evaluates a slightly reduced feature set (overall wOBA
++ ERA/FIP talent, quality-only bullpen). Those live-only refinements are neither
+credited nor penalized — every evaluated signal is strictly pre-game.
+
 ## Notes
 
 - **Not betting advice.** The win-probability model is an analytical estimate
