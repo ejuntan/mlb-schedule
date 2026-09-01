@@ -1084,9 +1084,11 @@ def prediction_html(pred, drv, away_name, home_name):
       <div class="pred-nums">Projected runs: {esc(away_name)} <b>{pred['e_away']}</b> &ndash; <b>{pred['e_home']}</b> {esc(home_name)}
         &nbsp;·&nbsp; total <b>{pred['exp_total']}</b> &nbsp;·&nbsp; park {esc(pf_txt)}</div>
       <div class="pred-drivers">
-        Offense (wOBA vs {esc(drv['away_hand'])}HP/{esc(drv['home_hand'])}HP): {esc(away_name)} {esc(drv['away_woba'])} vs {esc(drv['home_woba'])} {esc(home_name)}
-        &nbsp;·&nbsp; Starter R/9: {esc(drv['away_sp'])} vs {esc(drv['home_sp'])} (~{esc(drv['away_ip'])}/{esc(drv['home_ip'])} IP)
+        Offense wRC+ (60% form / 40% vs hand): {esc(away_name)} <b>{esc(drv['away_wrc'])}</b>{esc(drv['away_fb'])} vs <b>{esc(drv['home_wrc'])}</b>{esc(drv['home_fb'])} {esc(home_name)}
+        &nbsp;·&nbsp; wOBA vs {esc(drv['away_hand'])}HP/{esc(drv['home_hand'])}HP {esc(drv['away_woba'])}/{esc(drv['home_woba'])}
+        <br>Starter R/9: {esc(drv['away_sp'])} vs {esc(drv['home_sp'])} (~{esc(drv['away_ip'])}/{esc(drv['home_ip'])} IP)
         &nbsp;·&nbsp; Pen R/9: {esc(drv['away_pen'])} vs {esc(drv['home_pen'])}
+        <span class="fb-note">{" ⚑ = split fell back to prior season (<150 PA)" if (drv['home_fb'] or drv['away_fb']) else ""}</span>
       </div>
       {odds_html}
       <div class="pred-note">Negative-binomial run model — recency-weighted handedness offense, starter+bullpen (quality×availability), park factor. Analysis only, not betting advice.</div>
@@ -1154,9 +1156,16 @@ def game_card(game, records, team_stats, pitchers, bvp_map, bullpens, league,
         w = feat.get("off_woba")
         return f"{w:.3f}".lstrip("0") if isinstance(w, float) else "—"
 
+    def _wrc(feat):
+        m = feat.get("off_mult")
+        return round(m * 100) if m else "—"
+
     drv = {
         "home_hand": esc(home_hand), "away_hand": esc(away_hand),
         "home_woba": _woba_txt(home_feat), "away_woba": _woba_txt(away_feat),
+        "home_wrc": _wrc(home_feat), "away_wrc": _wrc(away_feat),
+        "home_fb": " ⚑" if home_feat.get("off_fallback") else "",
+        "away_fb": " ⚑" if away_feat.get("off_fallback") else "",
         "home_sp": round(home_feat["sp_ra"], 2), "away_sp": round(away_feat["sp_ra"], 2),
         "home_pen": round(home_feat["pen_ra"], 2), "away_pen": round(away_feat["pen_ra"], 2),
         "home_ip": round(home_feat["proj_ip"], 1), "away_ip": round(away_feat["proj_ip"], 1),
@@ -1254,6 +1263,7 @@ justify-content:flex-end;padding:0 8px;white-space:nowrap;min-width:0;overflow:h
 .pred-odds{font-size:11px;margin-top:7px;padding-top:7px;border-top:1px dashed var(--line);}
 .val-yes{color:var(--good);font-weight:700;background:rgba(63,185,80,.12);border-radius:5px;padding:1px 6px;}
 .val-no{color:var(--muted);}
+.fb-note{color:var(--accent2);font-size:10px;}
 .role{display:inline-block;font-size:8px;font-weight:700;color:var(--bg);
 background:var(--accent);border-radius:4px;padding:1px 4px;margin-left:5px;vertical-align:middle;}
 td.st{color:var(--muted);white-space:nowrap;font-size:10px;}
