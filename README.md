@@ -112,8 +112,12 @@ Put nginx/Caddy in front for TLS if exposing publicly.
 Shared by the live site and the backtest so both run identical math. Expected
 runs per team come from:
 
-- **Handedness offense** — team wOBA vs the *opposing starter's hand* (vs RHP /
-  vs LHP), not just runs/game.
+- **Offense** — a multiplier of **60% general + 40% hand-specific**. General
+  offense blends **7 / 15 / 30-day rolling wOBA with season** (≈ rolling wRC+),
+  each window regressed to league by PA. Hand-specific is the team's split vs the
+  opposing starter's hand — and when a split has fewer than
+  `MIN_SPLIT_PLATE_APPEARANCES` (150) PA, it falls back to the previous season's
+  split for that team/hand.
 - **Offensive quality** — wOBA (linear weights) + ISO + OPS, with a wRC+ estimate.
 - **Starter** — a true-talent run rate blending ERA / FIP / xFIP / xERA.
 - **Expected starter innings** — projected from IP/GS; a 6.5-IP arm shifts more

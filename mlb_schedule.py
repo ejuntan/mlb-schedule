@@ -282,6 +282,7 @@ def fetch_team_hand_splits(season, team_ids):
                 entry[hand] = {
                     "woba": model.calc_woba(st),
                     "ops": st.get("ops"),
+                    "pa": model._num(st, "plateAppearances"),
                 }
                 # accumulate league totals
                 for k in ("atBats", "hits", "doubles", "triples", "homeRuns",
@@ -317,10 +318,11 @@ def fetch_recent_pitching(day):
     return out
 
 
-def fetch_offense_recency(day, season):
+def fetch_offense_windows(day, season):
     """
-    Per-team offense recency multiplier: (season+L30 regressed wOBA) / season wOBA,
-    clamped. Applied to the handedness split so recent form nudges the projection.
+    Per-team GENERAL offense multiplier (~wRC+/100, park-neutral): a blend of
+    7/15/30-day rolling wOBA and season wOBA, each regressed to league by PA.
+    Returns ({team_id: general_mult}, lg_woba).
     """
     gd = datetime.strptime(day, "%Y-%m-%d").date()
     ed = (gd - timedelta(days=1)).isoformat()
@@ -336,20 +338,42 @@ def fetch_offense_recency(day, season):
                 out[tid] = (model.calc_woba(st), model._num(st, "plateAppearances"))
         return out
 
-    season_h = hit(f"{season}-03-01")
-    l30_h = hit((gd - timedelta(days=30)).isoformat())
-    wobas = [w for w, _ in season_h.values() if w]
+    windows = {
+        "d7": hit((gd - timedelta(days=7)).isoformat()),
+        "d15": hit((gd - timedelta(days=15)).isoformat()),
+        "d30": hit((gd - timedelta(days=30)).isoformat()),
+        "season": hit(f"{season}-03-01"),
+    }
+    season_w = windows["season"]
+    wobas = [w for w, _ in season_w.values() if w]
     lg_woba = sum(wobas) / len(wobas) if wobas else 0.315
 
-    factors = {}
-    for tid, (w_s, pa_s) in season_h.items():
-        if not w_s:
-            factors[tid] = 1.0
-            continue
-        w30, pa30 = l30_h.get(tid, (None, 0))
-        blended = model.recency_blend(w_s, pa_s, w30, pa30, lg_woba, 170)
-        factors[tid] = max(0.9, min(1.1, blended / w_s))
-    return factors
+    mult = {}
+    for tid in season_w:
+        blended = 0.0
+        for key, weight in model.OFFENSE_WINDOW_WEIGHTS.items():
+            wo, pa = windows[key].get(tid, (None, 0))
+            blended += weight * model.regress(wo, pa, 170, lg_woba)
+        mult[tid] = blended / lg_woba if lg_woba else 1.0
+    return mult, lg_woba
+
+
+def apply_split_fallback(splits, prev_splits):
+    """
+    Where a current-season handedness split has < MIN_SPLIT_PLATE_APPEARANCES,
+    substitute the previous season's split for that team/hand.
+    """
+    for tid, hs in splits.items():
+        for hand in ("R", "L"):
+            cur = hs.get(hand) or {}
+            if (cur.get("pa") or 0) < model.MIN_SPLIT_PLATE_APPEARANCES:
+                pv = (prev_splits.get(tid) or {}).get(hand) or {}
+                if pv.get("woba"):
+                    cur = dict(cur)
+                    cur["woba"] = pv["woba"]
+                    cur["fallback"] = True
+            hs[hand] = cur
+    return splits
 
 
 # ---------------------------------------------------------------------------
@@ -799,9 +823,16 @@ def build_features(rec, pitcher, sp_pid, pen, hand_split, opp_hand, lg,
 
     off = (hand_split or {}).get(opp_hand, {})
     base_woba = off.get("woba")
-    factor = (recency or {}).get("off", {}).get(team_id, 1.0)
-    off_woba = base_woba * factor if base_woba else None
     lg_off_woba = (lg.get("woba") or {}).get(opp_hand)
+
+    # Offense multiplier = 60% general (rolling 7/15/30 + season) + 40% hand.
+    general_mult = (recency or {}).get("general", {}).get(team_id, 1.0)
+    if base_woba and lg_off_woba:
+        hand_mult = base_woba / lg_off_woba
+        off_mult = (model.GENERAL_OFFENSE_WEIGHT * general_mult
+                    + model.HAND_OFFENSE_WEIGHT * hand_mult)
+    else:
+        off_mult = general_mult
 
     rspg, rapg = _season_run_env(rec)
 
@@ -831,7 +862,8 @@ def build_features(rec, pitcher, sp_pid, pen, hand_split, opp_hand, lg,
                      "usage": r.get("usage", 1.0)})
     pen_ra = model.bullpen_run_prevention(arms, lg_era)
 
-    return {"off_woba": off_woba, "lg_off_woba": lg_off_woba,
+    return {"off_mult": off_mult, "off_woba": base_woba,
+            "lg_off_woba": lg_off_woba, "off_fallback": off.get("fallback", False),
             "sp_ra": sp_ra, "proj_ip": proj_ip, "pen_ra": pen_ra,
             "rspg": rspg, "rapg": rapg, "off_ops": off.get("ops")}
 
@@ -1410,12 +1442,14 @@ def generate_page(day, force=False):
         for pid, bvp in ex.map(load_bvp, list(pitcher_jobs.items())):
             bvp_map[pid] = bvp
 
-    print("Handedness splits (team vs RHP/LHP wOBA) ...")
+    print("Handedness splits (vs RHP/LHP) + prev-season fallback (<150 PA) ...")
     hand_splits, lg_woba = fetch_team_hand_splits(season, team_ids)
+    prev_splits, _ = fetch_team_hand_splits(season - 1, team_ids)
+    hand_splits = apply_split_fallback(hand_splits, prev_splits)
 
-    print("Recency (last-30-day form) + live odds (if key set) ...")
-    recency = {"pit": fetch_recent_pitching(day),
-               "off": fetch_offense_recency(day, season)}
+    print("Rolling offense (7/15/30-day + season) + recency + odds ...")
+    general_mult, _ = fetch_offense_windows(day, season)
+    recency = {"pit": fetch_recent_pitching(day), "general": general_mult}
     odds_map = odds.fetch_odds(day)
     if odds_map:
         print(f"      live odds for {len(odds_map)} games.")

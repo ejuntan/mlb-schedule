@@ -60,6 +60,18 @@ PARK_FACTORS = {
 WOBA_W = {"bb": 0.69, "hbp": 0.72, "b1": 0.88, "b2": 1.25, "b3": 1.58, "hr": 2.03}
 WOBA_SCALE = 1.15
 
+# A handedness split needs at least this many PA to be trusted; below it we fall
+# back to the previous season's split for the same team/hand.
+MIN_SPLIT_PLATE_APPEARANCES = 150
+
+# Offense = 60% general (overall, rolling+season) + 40% hand-specific.
+GENERAL_OFFENSE_WEIGHT = 0.60
+HAND_OFFENSE_WEIGHT = 0.40
+
+# Rolling-window blend for GENERAL offense (7/15/30-day + season), each window
+# regressed to league by its plate appearances before weighting.
+OFFENSE_WINDOW_WEIGHTS = {"d7": 0.15, "d15": 0.20, "d30": 0.25, "season": 0.40}
+
 # --- Model configuration (tunable; the backtest can sweep these) ---
 DEFAULT_CFG = {
     "hfa_runs": 0.18,        # home-field edge, in runs added to the home mean
@@ -412,6 +424,10 @@ def predict(home, away, ctx, cfg=None):
     pf_mult = 1 + (pf / 100.0 - 1) * cfg["park_strength"]
 
     def off_mult(feat):
+        # Preferred: a precomputed offense multiplier (general+hand, rolling+season).
+        m = feat.get("off_mult")
+        if m is not None:
+            return max(0.6, min(1.6, m))
         w = feat.get("off_woba")
         lw = feat.get("lg_off_woba") or ctx.get("lg_woba")
         if w and lw:
