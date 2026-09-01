@@ -115,8 +115,10 @@ def asof_stats(cutoff):
                             "rspg": model._num(st, "runs") / g}
         return out
 
-    off = hitting(start, end)
-    off30 = hitting(recent_start, end)
+    off = hitting(start, end)                                        # season
+    off30 = hitting(recent_start, end)                               # L30
+    off7 = hitting((cutoff - timedelta(days=7)).isoformat(), end)    # L7
+    off15 = hitting((cutoff - timedelta(days=15)).isoformat(), end)  # L15
     lg_woba = (sum(o["woba"] for o in off.values() if o["woba"])
                / max(1, sum(1 for o in off.values() if o["woba"]))) or 0.315
 
@@ -146,12 +148,19 @@ def asof_stats(cutoff):
         p["talent"] = model.recency_blend(season_t, p["ip"], recent_t,
                                           p30.get("ip"), lg_era, K_IP)
 
-    # Recency-weighted, regressed wOBA per team.
+    # GENERAL offense multiplier: 7/15/30-day rolling + season wOBA, each
+    # regressed to league by PA (matches the live model's general offense).
+    # Handedness is live-only (statSplits ignores date ranges), so the backtest
+    # uses general offense for both — a documented approximation.
     K_PA = 170
+    win = {"d7": off7, "d15": off15, "d30": off30, "season": off}
     for tid, o in off.items():
-        o30 = off30.get(tid, {})
-        o["woba_reg"] = model.recency_blend(o["woba"], o["pa"], o30.get("woba"),
-                                            o30.get("pa"), lg_woba, K_PA)
+        blended = 0.0
+        for key, weight in model.OFFENSE_WINDOW_WEIGHTS.items():
+            wv = win[key].get(tid, {})
+            blended += weight * model.regress(wv.get("woba"), wv.get("pa"),
+                                              K_PA, lg_woba)
+        o["mult"] = blended / lg_woba if lg_woba else 1.0
 
     # Bullpen: regressed talent + role (for expected usage).
     pen_by_team = {}
@@ -279,8 +288,8 @@ def build_side(team_id, sp_id, store, usage, game_day):
     off = store["off"].get(team_id, {})
     deff = store["deff"].get(team_id, {})
     return {
-        "off_woba": off.get("woba_reg") or off.get("woba"),
-        "lg_off_woba": store["lg_woba"],
+        "off_mult": off.get("mult"),
+        "off_woba": off.get("woba"), "lg_off_woba": store["lg_woba"],
         "sp_ra": sp_ra, "proj_ip": proj_ip, "pen_ra": pen_ra,
         "rspg": off.get("rspg"), "rapg": deff.get("rapg"),
     }
