@@ -13,6 +13,7 @@ No key => fetch_odds() returns {} and the site renders exactly as before.
 import os
 import ssl
 import json
+import time
 from urllib.request import urlopen, Request
 
 ODDS_HOST = "https://api.the-odds-api.com/v4"
@@ -77,15 +78,23 @@ def _to_id(name):
     return None
 
 
+# Cache the (single) upcoming-odds response so repeated page builds — e.g. the
+# 15-minute prewarm — don't each spend an API credit. Tune with ODDS_CACHE_TTL.
+_odds_cache = {"ts": 0, "data": {}}
+
+
 def fetch_odds(day=None, regions="us", best_line=True):
     """
     {(home_id, away_id): {"home_dec", "away_dec", "home_ml", "away_ml", "books"}}
     for upcoming MLB games. Empty dict if ODDS_API_KEY is unset or the call fails.
-    `day` is accepted for interface symmetry; the API returns upcoming games.
+    Cached for ODDS_CACHE_TTL seconds to conserve the API quota.
     """
     key = os.environ.get("ODDS_API_KEY")
     if not key:
         return {}
+    ttl = int(os.environ.get("ODDS_CACHE_TTL", "1800"))  # 30 min
+    if _odds_cache["data"] and (time.time() - _odds_cache["ts"]) < ttl:
+        return _odds_cache["data"]
     url = (f"{ODDS_HOST}/sports/baseball_mlb/odds?apiKey={key}"
            f"&regions={regions}&markets=h2h&oddsFormat=american")
     data = _get(url)
@@ -120,6 +129,8 @@ def fetch_odds(day=None, regions="us", best_line=True):
             "home_ml": _dec_to_american(hd), "away_ml": _dec_to_american(ad),
             "books": nbooks,
         }
+    _odds_cache["ts"] = time.time()
+    _odds_cache["data"] = out
     return out
 
 

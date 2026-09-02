@@ -1335,10 +1335,18 @@ def top_plays_html(metas, have_odds):
     """
     if not metas:
         return ""
+    heading = "⭐ Top 3 plays"
     if have_odds:
-        ranked = sorted([m for m in metas if m["edge"] is not None],
-                        key=lambda m: m["edge"], reverse=True)
-        basis = "biggest edge vs the market"
+        # Value picks only: model edge over the market, biggest first.
+        value = sorted([m for m in metas if m["edge"] is not None and m["has_value"]],
+                       key=lambda m: m["edge"], reverse=True)
+        ranked = value
+        basis = "biggest edge vs the market (value picks only)"
+        heading = "⭐ Top 3 value picks"
+        if not value:
+            return ('<div class="top" style="max-width:1100px"><h2>⭐ Top value picks</h2>'
+                    '<div class="tsub">No positive-edge value picks on the board today '
+                    '— the market and model agree. Analysis only, not betting advice.</div></div>')
     else:
         ranked = sorted(metas, key=lambda m: m["conf"], reverse=True)
         basis = "highest model confidence (no odds key set)"
@@ -1366,7 +1374,7 @@ def top_plays_html(metas, have_odds):
       </a>"""
     return f"""
   <div class="top">
-    <h2>⭐ Top 3 plays</h2>
+    <h2>{esc(heading)}</h2>
     <div class="tsub">Ranked by {esc(basis)}. Analysis only, not betting advice.</div>
     <div class="top-grid">{cards}</div>
   </div>"""
@@ -1606,7 +1614,9 @@ def generate_page(day, force=False):
     print("Rolling offense (7/15/30-day + season) + recency + odds ...")
     general_mult, _ = fetch_offense_windows(day, season)
     recency = {"pit": fetch_recent_pitching(day), "general": general_mult}
-    odds_map = odds.fetch_odds(day)
+    # The live odds API only has UPCOMING games, so only spend a credit for
+    # today's slate; other dates never call it (conserves the free quota).
+    odds_map = odds.fetch_odds(day) if day == date.today().isoformat() else {}
     if odds_map:
         print(f"      live odds for {len(odds_map)} games.")
 
