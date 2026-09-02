@@ -165,10 +165,12 @@ def evaluate(p_home, o):
     dec_pick = hd if pick_home else ad
     implied_pick = (1 / dec_pick)
     edge = p_pick - implied_pick
+    # Break-even ("fair") decimal: you need a book priced ABOVE this to have edge.
+    min_dec = round(1 / p_pick, 2) if p_pick else None
     return {
         "home_ml": o.get("home_ml"), "away_ml": o.get("away_ml"),
         "home_dec": round(hd, 2), "away_dec": round(ad, 2),
-        "pick_dec": round(dec_pick, 2),
+        "pick_dec": round(dec_pick, 2), "min_dec": min_dec,
         "books": o.get("books"),
         "market_home_pct": round(fair_h * 100),
         "model_home_pct": round(p_home * 100),
