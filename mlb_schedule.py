@@ -1061,16 +1061,15 @@ def prediction_html(pred, drv, away_name, home_name):
     odds_html = ""
     if o:
         side = home_name if o["pick_home"] else away_name
-        ml = o["home_ml"] if o["pick_home"] else o["away_ml"]
-        ml_txt = f"{'+' if (ml or 0) > 0 else ''}{ml}"
+        dec = o.get("pick_dec", "—")
         badge = (f'<span class="val-yes">✓ VALUE +{o["edge_pct"]}%</span>'
                  if o["value"] else
                  f'<span class="val-no">no edge ({o["edge_pct"]}%)</span>')
         odds_html = f"""
       <div class="pred-odds">
-        Market: {esc(away_name)} {esc(o['away_ml'])} / {esc(o['home_ml'])} {esc(home_name)}
+        Market (decimal): {esc(away_name)} {esc(o['away_dec'])} / {esc(o['home_dec'])} {esc(home_name)}
         &nbsp;·&nbsp; model {o['model_home_pct']}% vs market {o['market_home_pct']}% (home)
-        &nbsp;·&nbsp; pick {esc(side)} {esc(ml_txt)} {badge}
+        &nbsp;·&nbsp; pick {esc(side)} @ {esc(dec)} {badge}
         <span class="pred-note"> · {o['books']} books · analysis only, not betting advice</span>
       </div>"""
     return f"""
@@ -1182,8 +1181,7 @@ def game_card(game, records, team_stats, pitchers, bvp_map, bullpens, league,
         "gametime": gametime,
         "edge": (o["edge_pct"] if o else None),
         "has_value": bool(o and o["value"]),
-        "market_ml": (o["home_ml"] if (o and o["pick_home"])
-                      else o["away_ml"] if o else None),
+        "market_dec": (o.get("pick_dec") if o else None),
     }
 
     card = f"""
@@ -1356,12 +1354,11 @@ def top_plays_html(metas, have_odds):
     cards = ""
     for i, m in enumerate(top, 1):
         if have_odds and m["edge"] is not None:
-            ml = m["market_ml"]
-            ml_txt = f"{'+' if (ml or 0) > 0 else ''}{ml}" if ml is not None else ""
+            dec = m.get("market_dec") or "—"
             tag = (f'<span class="tag val">+{m["edge"]}% edge</span>'
                    if m["has_value"] else
                    f'<span class="tag conf">{m["edge"]}% vs mkt</span>')
-            why = f"model {m['pick_pct']}% · {ml_txt}"
+            why = f"model {m['pick_pct']}% @ {dec}"
         else:
             tag = f'<span class="tag conf">{m["pick_pct"]}% win prob</span>'
             why = f"{esc(m['away'])} @ {esc(m['home'])} · {esc(m['gametime'])}"
@@ -1388,10 +1385,10 @@ def ranked_table_html(metas, have_odds):
     for m in metas:
         edge = m["edge"]
         edge_attr = edge if edge is not None else -999
-        ml = m["market_ml"]
-        ml_txt = (f"{'+' if (ml or 0) > 0 else ''}{ml}") if ml is not None else "—"
+        dec = m.get("market_dec")
+        dec_txt = f"{dec}" if dec is not None else "—"
         edge_cell = (f"{edge:+.1f}%" if edge is not None else "—")
-        odds_cells = (f'<td>{esc(ml_txt)}</td>'
+        odds_cells = (f'<td>{esc(dec_txt)}</td>'
                       f'<td class="{"r-val" if m["has_value"] else ""}">{edge_cell}</td>'
                       if have_odds else "")
         rows += (f'<tr data-conf="{m["conf"]:.4f}" data-edge="{edge_attr}" '
@@ -1399,7 +1396,7 @@ def ranked_table_html(metas, have_odds):
                  f'<td class="r-num"></td><td class="r-pick">{esc(m["pick"])}</td>'
                  f'<td class="r-match">{esc(m["away"])} @ {esc(m["home"])}</td>'
                  f'<td>{m["pick_pct"]}%</td>{odds_cells}</tr>')
-    edge_hdr = "<th>ML</th><th>Edge</th>" if have_odds else ""
+    edge_hdr = "<th>Dec</th><th>Edge</th>" if have_odds else ""
     edge_btn = ('<button id="btn-edge" onclick="sortPlays(\'edge\')">By edge</button>'
                 if have_odds else "")
     default = "edge" if have_odds else "conf"

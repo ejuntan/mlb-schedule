@@ -142,6 +142,8 @@ def _dec_to_american(dec):
     return round(-100 / (dec - 1))
 
 
+
+
 def evaluate(p_home, o):
     """
     Compare model prob to market. Returns a dict for display, or None if no odds.
@@ -165,6 +167,8 @@ def evaluate(p_home, o):
     edge = p_pick - implied_pick
     return {
         "home_ml": o.get("home_ml"), "away_ml": o.get("away_ml"),
+        "home_dec": round(hd, 2), "away_dec": round(ad, 2),
+        "pick_dec": round(dec_pick, 2),
         "books": o.get("books"),
         "market_home_pct": round(fair_h * 100),
         "model_home_pct": round(p_home * 100),
