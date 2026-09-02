@@ -296,6 +296,61 @@ def fetch_team_hand_splits(season, team_ids):
 
 
 # ---------------------------------------------------------------------------
+# NRFI: first-inning pitcher splits + league first-inning baseline
+# ---------------------------------------------------------------------------
+
+def fetch_first_inning(pitcher_ids, season):
+    """{pid: (fi_ip, fi_runs)} — each starter's 1st-inning line (sitCode i01)."""
+    def load(pid):
+        d = get_json(f"{STATS}/people/{pid}?hydrate=stats(group=[pitching],"
+                     f"type=[statSplits],sitCodes=[i01],season={season})")
+        ip = runs = 0.0
+        if d and d.get("people"):
+            for grp in d["people"][0].get("stats", []):
+                for s in grp.get("splits", []):
+                    st = s.get("stat", {})
+                    ip += model.ip_to_float(st.get("inningsPitched"))
+                    runs += model._num(st, "runs")
+        return pid, (ip, runs)
+
+    out = {}
+    ids = [p for p in pitcher_ids if p]
+    if ids:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for pid, v in ex.map(load, ids):
+                out[pid] = v
+    return out
+
+
+def fetch_league_first_inning(day):
+    """League P(team scores in 1st) and runs/half from the last 21 days."""
+    gd = datetime.strptime(day, "%Y-%m-%d").date()
+    start = (gd - timedelta(days=21)).isoformat()
+    end = (gd - timedelta(days=1)).isoformat()
+    d = get_json(f"{STATS}/schedule?sportId={SPORT_ID}"
+                 f"&startDate={start}&endDate={end}&hydrate=linescore")
+    halves = scored = 0
+    runs = 0.0
+    if d:
+        for dd in d.get("dates", []):
+            for g in dd.get("games", []):
+                if g.get("status", {}).get("abstractGameState") != "Final":
+                    continue
+                inns = g.get("linescore", {}).get("innings", [])
+                if not inns:
+                    continue
+                for side in ("away", "home"):
+                    r = inns[0].get(side, {}).get("runs")
+                    if r is None:
+                        continue
+                    halves += 1
+                    runs += r
+                    scored += 1 if r > 0 else 0
+    return {"p_score": scored / halves if halves else 0.28,
+            "runs_per_half": runs / halves if halves else 0.52, "n": halves}
+
+
+# ---------------------------------------------------------------------------
 # Recency (last-30-day) inputs, blended + regressed in the prediction model
 # ---------------------------------------------------------------------------
 
@@ -1057,6 +1112,15 @@ def prediction_html(pred, drv, away_name, home_name):
     fav_pct = max(pred["p_home"], pred["p_away"])
     pf = pred["park_factor"]
     pf_txt = f"{pf} ({'hitter' if pf > 102 else 'pitcher' if pf < 98 else 'neutral'})"
+    nr = pred.get("nrfi")
+    nrfi_html = ""
+    if nr:
+        lean = "NRFI" if nr["pct"] >= 50 else "YRFI"
+        nrfi_html = (f'<div class="pred-nrfi">🥎 <b>NRFI {nr["pct"]}%</b> '
+                     f'/ YRFI {nr["yrfi"]}% &nbsp;·&nbsp; lean <b>{lean}</b> '
+                     f'(fair {nr["fair"]}) &nbsp;·&nbsp; '
+                     f'{esc(away_name)} score-1st {nr["p_away"]}% · '
+                     f'{esc(home_name)} {nr["p_home"]}%</div>')
     o = pred.get("odds")
     odds_html = ""
     if o:
@@ -1091,12 +1155,13 @@ def prediction_html(pred, drv, away_name, home_name):
         <span class="fb-note">{" ⚑ = split fell back to prior season (<150 PA)" if (drv['home_fb'] or drv['away_fb']) else ""}</span>
       </div>
       {odds_html}
+      {nrfi_html}
       <div class="pred-note">Negative-binomial run model — recency-weighted handedness offense, starter+bullpen (quality×availability), park factor. Analysis only, not betting advice.</div>
     </div>"""
 
 
 def game_card(game, records, team_stats, pitchers, bvp_map, bullpens, league,
-              hand_splits, recency, odds_map):
+              hand_splits, recency, odds_map, nrfi_ctx):
     teams = game.get("teams", {})
     home_t = teams.get("home", {}).get("team", {})
     away_t = teams.get("away", {}).get("team", {})
@@ -1147,10 +1212,33 @@ def game_card(game, records, team_stats, pitchers, bvp_map, bullpens, league,
     away_feat = build_features(rec_for("away", away_id), away_pitcher, away_pid,
                                away_pen, hand_splits.get(away_id), home_hand,
                                league, away_id, recency)
-    ctx = {"lg_r": league["R"], "park_factor": model.park_factor(home_id)}
+    park = model.park_factor(home_id)
+    ctx = {"lg_r": league["R"], "park_factor": park}
     pred = model.predict(home_feat, away_feat, ctx)
     pred["odds"] = odds.evaluate(pred["p_home_raw"],
                                  odds_map.get((home_id, away_id))) if odds_map else None
+
+    # NRFI: reuse starter talent (sp_ra) + offense (off_mult) already computed.
+    pred["nrfi"] = None
+    lgfi = nrfi_ctx.get("lgfi")
+    if lgfi and home_pitcher and away_pitcher:
+        fi = nrfi_ctx.get("fi", {})
+        lg_era = league["ERA"]
+        rr = lgfi["runs_per_half"]
+        h_ip, h_r = fi.get(home_pid, (0, 0))
+        a_ip, a_r = fi.get(away_pid, (0, 0))
+        home_fi = model.fi_shrink_rate(h_r, h_ip, home_feat["sp_ra"], lg_era, rr)
+        away_fi = model.fi_shrink_rate(a_r, a_ip, away_feat["sp_ra"], lg_era, rr)
+        boost = model.NRFI_TOP3_BOOST
+        # Home offense faces away SP; away offense faces home SP.
+        ph = model.team_pscore_1st(home_feat["off_mult"] or 1.0, boost, away_fi,
+                                   lgfi["p_score"], rr, park)
+        pa = model.team_pscore_1st(away_feat["off_mult"] or 1.0, boost, home_fi,
+                                   lgfi["p_score"], rr, park)
+        nrfi = model.nrfi_prob(ph, pa)
+        pred["nrfi"] = {"pct": round(nrfi * 100), "yrfi": round((1 - nrfi) * 100),
+                        "fair": round(1 / nrfi, 2) if nrfi else None,
+                        "p_home": round(ph * 100), "p_away": round(pa * 100)}
 
     def _woba_txt(feat):
         w = feat.get("off_woba")
@@ -1277,6 +1365,7 @@ justify-content:flex-end;padding:0 8px;white-space:nowrap;min-width:0;overflow:h
 .pred-drivers{font-size:11px;color:var(--muted);margin-top:4px;}
 .pred-note{font-size:9px;color:var(--muted);margin-top:6px;font-style:italic;}
 .pred-odds{font-size:11px;margin-top:7px;padding-top:7px;border-top:1px dashed var(--line);}
+.pred-nrfi{font-size:11px;margin-top:7px;padding-top:7px;border-top:1px dashed var(--line);color:var(--text);}
 .val-yes{color:var(--good);font-weight:700;background:rgba(63,185,80,.12);border-radius:5px;padding:1px 6px;}
 .val-no{color:var(--muted);}
 .fb-note{color:var(--accent2);font-size:10px;}
@@ -1431,14 +1520,15 @@ def ranked_table_html(metas, have_odds):
 
 
 def build_html(games, records, team_stats, day, pitchers, bvp_map, bullpens,
-               league, hand_splits, recency, odds_map):
+               league, hand_splits, recency, odds_map, nrfi_ctx):
     if not games:
         body = '<div class="empty">No MLB games scheduled for this date.</div>'
     else:
         cards, metas = [], []
         for g in games:
             card, meta = game_card(g, records, team_stats, pitchers, bvp_map,
-                                   bullpens, league, hand_splits, recency, odds_map)
+                                   bullpens, league, hand_splits, recency,
+                                   odds_map, nrfi_ctx)
             cards.append(card)
             metas.append(meta)
         have_odds = bool(odds_map)
@@ -1613,9 +1703,12 @@ def generate_page(day, force=False):
     prev_splits, _ = fetch_team_hand_splits(season - 1, team_ids)
     hand_splits = apply_split_fallback(hand_splits, prev_splits)
 
-    print("Rolling offense (7/15/30-day + season) + recency + odds ...")
+    print("Rolling offense (7/15/30-day + season) + recency + NRFI + odds ...")
     general_mult, _ = fetch_offense_windows(day, season)
     recency = {"pit": fetch_recent_pitching(day), "general": general_mult}
+    starter_ids = [pid for pid in pitcher_jobs]
+    nrfi_ctx = {"fi": fetch_first_inning(starter_ids, season),
+                "lgfi": fetch_league_first_inning(day)}
     # The live odds API only has UPCOMING games, so only spend a credit for
     # today's slate; other dates never call it (conserves the free quota).
     odds_map = odds.fetch_odds(day) if day == date.today().isoformat() else {}
@@ -1626,7 +1719,7 @@ def generate_page(day, force=False):
     league = compute_league(records, team_stats)
     league["woba"] = lg_woba
     page = build_html(games, records, team_stats, day, pitchers, bvp_map,
-                      bullpens, league, hand_splits, recency, odds_map)
+                      bullpens, league, hand_splits, recency, odds_map, nrfi_ctx)
     _PAGE_CACHE[day] = (time.time(), page)
     return page
 

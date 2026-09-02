@@ -87,6 +87,40 @@ def park_factor(home_team_id):
     return PARK_FACTORS.get(home_team_id, 100)
 
 
+# --------------------------------------------------------------------------
+# NRFI (no-run-first-inning) core — shared by nrfi.py and the site
+# --------------------------------------------------------------------------
+NRFI_CALIB = 0.90            # fit by nrfi.py --backtest (model over-predicts scoring)
+NRFI_SHRINK_K = 15.0         # innings of prior weight for 1st-inning shrinkage
+NRFI_TOP3_BOOST = 1.10       # default top-of-order boost when no lineup is posted
+
+
+def fi_shrink_rate(fi_runs, fi_ip, talent9, lg_era, lg_runs_per_half,
+                   k=NRFI_SHRINK_K):
+    """Starter's expected 1st-inning runs/inning: observed i01 line shrunk toward
+    the pitcher's rate-metric talent, scaled to the 1st-inning run environment."""
+    lg_era = lg_era or 4.15
+    talent_fi = (talent9 / 9.0) * (lg_runs_per_half / (lg_era / 9.0))
+    if fi_ip + k <= 0:
+        return talent_fi
+    return (fi_runs + talent_fi * k) / (fi_ip + k)
+
+
+def team_pscore_1st(off_mult, boost, opp_fi_rate, lg_p, lg_runs_per_half,
+                    park, calib=NRFI_CALIB):
+    """P(team scores in the 1st) via odds-ratio on the league base rate."""
+    lg_p = min(0.6, max(0.05, lg_p or 0.28))
+    base_odds = lg_p / (1 - lg_p)
+    pitch = (opp_fi_rate / lg_runs_per_half) if lg_runs_per_half else 1.0
+    odds = base_odds * off_mult * boost * pitch * (park / 100.0) * calib
+    return odds / (1 + odds)
+
+
+def nrfi_prob(p_home_scores, p_away_scores):
+    """P(no run in the 1st by either team)."""
+    return (1 - p_home_scores) * (1 - p_away_scores)
+
+
 # ---------------------------------------------------------------------------
 # Offense: wOBA / ISO from a counting-stat block
 # ---------------------------------------------------------------------------
