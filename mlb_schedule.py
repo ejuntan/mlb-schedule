@@ -1272,6 +1272,7 @@ def game_card(game, records, team_stats, pitchers, bvp_map, bullpens, league,
         "has_value": bool(o and o["value"]),
         "market_dec": (o.get("pick_dec") if o else None),
         "min_dec": (o.get("min_dec") if o else None),
+        "nrfi": pred.get("nrfi"),
     }
 
     card = f"""
@@ -1519,6 +1520,34 @@ def ranked_table_html(metas, have_odds):
   </details>"""
 
 
+def nrfi_ranked_html(metas):
+    """All games ranked by NRFI probability, highest first."""
+    rows_m = [m for m in metas if m.get("nrfi")]
+    if not rows_m:
+        return ""
+    rows_m.sort(key=lambda m: m["nrfi"]["pct"], reverse=True)
+    rows = ""
+    for i, m in enumerate(rows_m, 1):
+        n = m["nrfi"]
+        cls = "r-val" if n["pct"] >= 55 else ""
+        rows += (f'<tr onclick="location.hash=\'#game-{m["gid"]}\'">'
+                 f'<td class="r-num">#{i}</td>'
+                 f'<td class="r-match">{esc(m["away"])} @ {esc(m["home"])}</td>'
+                 f'<td class="{cls}"><b>{n["pct"]}%</b></td><td>{n["yrfi"]}%</td>'
+                 f'<td>{n["fair"]}</td>'
+                 f'<td>{n["p_away"]}% / {n["p_home"]}%</td></tr>')
+    return f"""
+  <details class="ranklist" open>
+    <summary>🥎 NRFI ranking — all {len(rows_m)} games (highest → lowest)</summary>
+    <div class="tsub" style="color:var(--muted);font-size:11px;margin:2px 0 8px">
+      P(no run in the 1st by either team), highest first. Green = ≥55%. Analysis only, not betting advice.</div>
+    <div class="rank-scroll"><table class="ranktable">
+      <thead><tr><th>#</th><th>Matchup</th><th>NRFI</th><th>YRFI</th><th>Fair</th>
+      <th>Score-1st away/home</th></tr></thead>
+      <tbody>{rows}</tbody></table></div>
+  </details>"""
+
+
 def build_html(games, records, team_stats, day, pitchers, bvp_map, bullpens,
                league, hand_splits, recency, odds_map, nrfi_ctx):
     if not games:
@@ -1534,7 +1563,9 @@ def build_html(games, records, team_stats, day, pitchers, bvp_map, bullpens,
         have_odds = bool(odds_map)
         top = top_plays_html(metas, have_odds)
         ranked = ranked_table_html(metas, have_odds)
-        body = top + ranked + '<div class="games">\n' + "\n".join(cards) + "\n</div>"
+        nrfi_rank = nrfi_ranked_html(metas)
+        body = (top + ranked + nrfi_rank
+                + '<div class="games">\n' + "\n".join(cards) + "\n</div>")
 
     pretty = datetime.strptime(day, "%Y-%m-%d").strftime("%A, %B %-d, %Y")
     legend = (
