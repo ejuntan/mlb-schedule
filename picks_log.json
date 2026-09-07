@@ -1,0 +1,187 @@
+{
+ "2026-09-02": {
+  "logged": "2026-09-07 14:24",
+  "games": [
+   {
+    "gid": 824470,
+    "away": "San Diego Padres",
+    "home": "Cincinnati Reds",
+    "pick": "San Diego Padres",
+    "prob": 55,
+    "nrfi_pct": 55,
+    "nrfi_lean": "NRFI",
+    "result": "loss",
+    "nrfi_result": "loss",
+    "final": "3-7"
+   },
+   {
+    "gid": 822686,
+    "away": "Atlanta Braves",
+    "home": "Washington Nationals",
+    "pick": "Atlanta Braves",
+    "prob": 53,
+    "nrfi_pct": 54,
+    "nrfi_lean": "NRFI",
+    "result": "win",
+    "nrfi_result": "win",
+    "final": "9-0"
+   },
+   {
+    "gid": 822851,
+    "away": "Athletics",
+    "home": "Texas Rangers",
+    "pick": "Texas Rangers",
+    "prob": 59,
+    "nrfi_pct": 54,
+    "nrfi_lean": "NRFI",
+    "result": "loss",
+    "nrfi_result": "loss",
+    "final": "9-2"
+   },
+   {
+    "gid": 824312,
+    "away": "Baltimore Orioles",
+    "home": "Colorado Rockies",
+    "pick": "Baltimore Orioles",
+    "prob": 57,
+    "nrfi_pct": 48,
+    "nrfi_lean": "YRFI",
+    "result": "loss",
+    "nrfi_result": "loss",
+    "final": "5-6"
+   },
+   {
+    "gid": 825037,
+    "away": "Philadelphia Phillies",
+    "home": "Arizona Diamondbacks",
+    "pick": "Arizona Diamondbacks",
+    "prob": 50,
+    "nrfi_pct": 44,
+    "nrfi_lean": "YRFI",
+    "result": "win",
+    "nrfi_result": "loss",
+    "final": "0-1"
+   },
+   {
+    "gid": 824717,
+    "away": "Seattle Mariners",
+    "home": "Boston Red Sox",
+    "pick": "Boston Red Sox",
+    "prob": 60,
+    "nrfi_pct": 54,
+    "nrfi_lean": "NRFI",
+    "result": "loss",
+    "nrfi_result": "win",
+    "final": "8-3"
+   },
+   {
+    "gid": 823339,
+    "away": "San Francisco Giants",
+    "home": "Pittsburgh Pirates",
+    "pick": "Pittsburgh Pirates",
+    "prob": 53,
+    "nrfi_pct": 55,
+    "nrfi_lean": "NRFI",
+    "result": "loss",
+    "nrfi_result": "loss",
+    "final": "5-4"
+   },
+   {
+    "gid": 822931,
+    "away": "New York Mets",
+    "home": "Tampa Bay Rays",
+    "pick": "Tampa Bay Rays",
+    "prob": 57,
+    "nrfi_pct": 52,
+    "nrfi_lean": "NRFI",
+    "result": "loss",
+    "nrfi_result": "loss",
+    "final": "10-4"
+   },
+   {
+    "gid": 824390,
+    "away": "Toronto Blue Jays",
+    "home": "Cleveland Guardians",
+    "pick": "Toronto Blue Jays",
+    "prob": 50,
+    "nrfi_pct": 60,
+    "nrfi_lean": "NRFI",
+    "result": "win",
+    "nrfi_result": "loss",
+    "final": "11-0"
+   },
+   {
+    "gid": 823660,
+    "away": "Detroit Tigers",
+    "home": "Minnesota Twins",
+    "pick": "Minnesota Twins",
+    "prob": 51,
+    "nrfi_pct": 50,
+    "nrfi_lean": "NRFI",
+    "result": "loss",
+    "nrfi_result": "win",
+    "final": "11-6"
+   },
+   {
+    "gid": 824068,
+    "away": "Miami Marlins",
+    "home": "Kansas City Royals",
+    "pick": "Kansas City Royals",
+    "prob": 52,
+    "nrfi_pct": 53,
+    "nrfi_lean": "NRFI",
+    "result": "loss",
+    "nrfi_result": "loss",
+    "final": "9-6"
+   },
+   {
+    "gid": 824634,
+    "away": "Milwaukee Brewers",
+    "home": "Chicago Cubs",
+    "pick": "Milwaukee Brewers",
+    "prob": 55,
+    "nrfi_pct": 48,
+    "nrfi_lean": "YRFI",
+    "result": "win",
+    "nrfi_result": "win",
+    "final": "9-5"
+   },
+   {
+    "gid": 824147,
+    "away": "Chicago White Sox",
+    "home": "Houston Astros",
+    "pick": "Houston Astros",
+    "prob": 52,
+    "nrfi_pct": 49,
+    "nrfi_lean": "YRFI",
+    "result": "win",
+    "nrfi_result": "loss",
+    "final": "0-2"
+   },
+   {
+    "gid": 823983,
+    "away": "New York Yankees",
+    "home": "Los Angeles Angels",
+    "pick": "New York Yankees",
+    "prob": 56,
+    "nrfi_pct": 59,
+    "nrfi_lean": "NRFI",
+    "result": "win",
+    "nrfi_result": "win",
+    "final": "6-3"
+   },
+   {
+    "gid": 823906,
+    "away": "St. Louis Cardinals",
+    "home": "Los Angeles Dodgers",
+    "pick": "Los Angeles Dodgers",
+    "prob": 63,
+    "nrfi_pct": 48,
+    "nrfi_lean": "YRFI",
+    "result": "loss",
+    "nrfi_result": "win",
+    "final": "8-6"
+   }
+  ]
+ }
+}

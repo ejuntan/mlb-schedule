@@ -1386,6 +1386,11 @@ padding:1px 7px;margin-top:6px;}
 .tag.val{background:rgba(63,185,80,.15);color:var(--good);}
 .tag.conf{background:rgba(76,154,255,.13);color:var(--accent);}
 @media(max-width:640px){.top-grid{grid-template-columns:1fr;}}
+.pick-day{font-size:12px;margin:6px 0;display:flex;flex-wrap:wrap;gap:6px;align-items:center;}
+.pick-chip{font-size:11px;border-radius:6px;padding:2px 7px;background:var(--card2);
+border:1px solid var(--line);white-space:nowrap;}
+.pick-chip.val-yes{color:var(--good);border-color:rgba(63,185,80,.4);}
+.pick-chip.val-no{color:var(--stc);border-color:rgba(219,109,157,.4);}
 .ranklist{max-width:1100px;margin:0 auto 22px;background:var(--card);
 border:1px solid var(--line);border-radius:12px;padding:8px 16px 14px;}
 .ranklist summary{cursor:pointer;font-size:13px;font-weight:700;padding:6px 0;}
@@ -1520,37 +1525,127 @@ def ranked_table_html(metas, have_odds):
   </details>"""
 
 
-def track_record_html():
-    """Banner showing the model's graded record from record.json (if present)."""
+PICKS_LOG = os.path.join(os.path.dirname(__file__), "picks_log.json")
+
+
+def _load_picks():
     try:
-        with open(os.path.join(os.path.dirname(__file__), "record.json")) as f:
-            r = json.load(f)
+        with open(PICKS_LOG) as f:
+            return json.load(f)
     except Exception:
+        return {}
+
+
+def _save_picks(d):
+    try:
+        with open(PICKS_LOG, "w") as f:
+            json.dump(d, f, indent=1)
+    except Exception as e:
+        print(f"  ! could not write picks log: {e}", file=sys.stderr)
+
+
+def log_day_picks(day, metas):
+    """Record the picks shown for `day` (once) so we can grade them later."""
+    log = _load_picks()
+    if day in log:
+        return
+    games = []
+    for m in metas:
+        nr = m.get("nrfi")
+        games.append({
+            "gid": m["gid"], "away": m["away"], "home": m["home"],
+            "pick": m["pick"], "prob": m["pick_pct"],
+            "nrfi_pct": (nr["pct"] if nr else None),
+            "nrfi_lean": (("NRFI" if nr["pct"] >= 50 else "YRFI") if nr else None),
+            "result": None, "nrfi_result": None, "final": None,
+        })
+    log[day] = {"logged": datetime.now().strftime("%Y-%m-%d %H:%M"), "games": games}
+    _save_picks(log)
+
+
+def grade_pending_picks():
+    """Grade any logged picks whose games are now Final, from MLB scores."""
+    log = _load_picks()
+    changed = False
+    for day, entry in log.items():
+        pending = [g for g in entry["games"] if g["result"] is None]
+        if not pending:
+            continue
+        data = get_json(f"{STATS}/schedule?sportId={SPORT_ID}&date={day}"
+                        f"&hydrate=linescore")
+        finals = {}
+        for dd in (data or {}).get("dates", []):
+            for g in dd.get("games", []):
+                if g.get("status", {}).get("abstractGameState") != "Final":
+                    continue
+                pk = g.get("gamePk")
+                hs = g["teams"]["home"].get("score")
+                as_ = g["teams"]["away"].get("score")
+                hn = g["teams"]["home"]["team"]["name"]
+                an = g["teams"]["away"]["team"]["name"]
+                inns = g.get("linescore", {}).get("innings", [])
+                fi_runs = 0
+                if inns:
+                    fi_runs = (inns[0].get("home", {}).get("runs", 0) or 0) + \
+                              (inns[0].get("away", {}).get("runs", 0) or 0)
+                if hs is not None and as_ is not None:
+                    finals[pk] = (hn if hs > as_ else an, f"{as_}-{hs}", fi_runs)
+        for g in pending:
+            fin = finals.get(g["gid"])
+            if not fin:
+                continue
+            winner, score, fi_runs = fin
+            g["result"] = "win" if winner == g["pick"] else "loss"
+            g["final"] = score
+            if g["nrfi_lean"]:
+                nrfi_happened = fi_runs == 0
+                g["nrfi_result"] = "win" if (
+                    (g["nrfi_lean"] == "NRFI") == nrfi_happened) else "loss"
+            changed = True
+    if changed:
+        _save_picks(log)
+    return log
+
+
+def picks_record_html():
+    """Banner + recent daily picks, graded against MLB finals."""
+    log = _load_picks()
+    if not log:
         return ""
-    months = " · ".join(f"{m['month'][5:]}: {m['record']}" for m in r.get("monthly", []))
+    all_games = [g for e in log.values() for g in e["games"]]
+    graded = [g for g in all_games if g["result"]]
+    if not graded:
+        return ""
+    w = sum(1 for g in graded if g["result"] == "win")
+    n = len(graded)
+    ng = [g for g in all_games if g["nrfi_result"]]
+    nw = sum(1 for g in ng if g["nrfi_result"] == "win")
+
+    # Most recent 2 logged days, most recent first
+    days = sorted(log.keys(), reverse=True)[:2]
+    recent = ""
+    for day in days:
+        chips = ""
+        for g in log[day]["games"]:
+            if g["result"] == "win":
+                cls, mark = "val-yes", "✓"
+            elif g["result"] == "loss":
+                cls, mark = "val-no", "✗"
+            else:
+                cls, mark = "", "·"
+            chips += (f'<span class="pick-chip {cls}">{mark} {esc(g["pick"])}'
+                      f' {g["prob"]}%</span>')
+        recent += (f'<div class="pick-day"><b>{esc(day)}</b> {chips}</div>')
+
+    nrfi_line = (f" &nbsp;·&nbsp; NRFI leans {nw}-{len(ng)-nw}"
+                 if ng else "")
     return f"""
   <div class="top" style="max-width:1100px">
-    <h2>📊 Model track record</h2>
-    <div class="tsub">Win-pick results graded against MLB final scores. {esc(r['span'])}.</div>
-    <div class="top-grid">
-      <div class="play" style="cursor:default">
-        <div class="rank">Straight-up picks</div>
-        <div class="pick">{r['wins']}–{r['losses']}</div>
-        <div class="why">{r['accuracy']}% correct · {r['games']} games</div>
-      </div>
-      <div class="play" style="cursor:default">
-        <div class="rank">Calibration (Brier)</div>
-        <div class="pick">{r['brier']}</div>
-        <div class="why">lower = better · 0.25 = coin-flip</div>
-      </div>
-      <div class="play" style="cursor:default">
-        <div class="rank">vs. pick-home baseline</div>
-        <div class="pick">{r['accuracy']}% / {r['pick_home_baseline']}%</div>
-        <div class="why">model vs. always-home</div>
-      </div>
-    </div>
-    <div class="tsub" style="margin-top:8px">Monthly: {esc(months)} &nbsp;·&nbsp;
-      updated {esc(r['generated'])}. Analysis only, not betting advice.</div>
+    <h2>📊 Daily picks record</h2>
+    <div class="tsub">Every day's straight-up picks, graded against MLB final
+      scores. {w}-{n-w} ({w/n*100:.0f}%) on {n} graded games{nrfi_line}.
+      Analysis only, not betting advice.</div>
+    {recent}
   </div>"""
 
 
@@ -1598,7 +1693,10 @@ def build_html(games, records, team_stats, day, pitchers, bvp_map, bullpens,
         top = top_plays_html(metas, have_odds)
         ranked = ranked_table_html(metas, have_odds)
         nrfi_rank = nrfi_ranked_html(metas)
-        body = (track_record_html() + top + ranked + nrfi_rank
+        # Record this day's picks (once) and grade any picks now Final.
+        log_day_picks(day, metas)
+        grade_pending_picks()
+        body = (picks_record_html() + top + ranked + nrfi_rank
                 + '<div class="games">\n' + "\n".join(cards) + "\n</div>")
 
     pretty = datetime.strptime(day, "%Y-%m-%d").strftime("%A, %B %-d, %Y")
