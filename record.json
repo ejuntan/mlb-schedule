@@ -1,0 +1,57 @@
+{
+  "generated": "2026-09-07 14:17",
+  "span": "2025-06-01 .. 2025-08-16",
+  "games": 985,
+  "wins": 529,
+  "losses": 456,
+  "accuracy": 53.7,
+  "brier": 0.2464,
+  "home_win_rate": 53.3,
+  "pick_home_baseline": 53.3,
+  "calibration": [
+    {
+      "bucket": "30-40%",
+      "n": 38,
+      "pred": 36.6,
+      "actual": 31.6
+    },
+    {
+      "bucket": "40-50%",
+      "n": 322,
+      "pred": 46.3,
+      "actual": 51.6
+    },
+    {
+      "bucket": "50-60%",
+      "n": 521,
+      "pred": 54.2,
+      "actual": 54.7
+    },
+    {
+      "bucket": "60-70%",
+      "n": 103,
+      "pred": 62.8,
+      "actual": 59.2
+    }
+  ],
+  "monthly": [
+    {
+      "month": "2025-06",
+      "games": 398,
+      "record": "209-189",
+      "acc": 52.5
+    },
+    {
+      "month": "2025-07",
+      "games": 371,
+      "record": "197-174",
+      "acc": 53.1
+    },
+    {
+      "month": "2025-08",
+      "games": 216,
+      "record": "123-93",
+      "acc": 56.9
+    }
+  ]
+}

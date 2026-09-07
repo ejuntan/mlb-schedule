@@ -1520,6 +1520,40 @@ def ranked_table_html(metas, have_odds):
   </details>"""
 
 
+def track_record_html():
+    """Banner showing the model's graded record from record.json (if present)."""
+    try:
+        with open(os.path.join(os.path.dirname(__file__), "record.json")) as f:
+            r = json.load(f)
+    except Exception:
+        return ""
+    months = " · ".join(f"{m['month'][5:]}: {m['record']}" for m in r.get("monthly", []))
+    return f"""
+  <div class="top" style="max-width:1100px">
+    <h2>📊 Model track record</h2>
+    <div class="tsub">Win-pick results graded against MLB final scores. {esc(r['span'])}.</div>
+    <div class="top-grid">
+      <div class="play" style="cursor:default">
+        <div class="rank">Straight-up picks</div>
+        <div class="pick">{r['wins']}–{r['losses']}</div>
+        <div class="why">{r['accuracy']}% correct · {r['games']} games</div>
+      </div>
+      <div class="play" style="cursor:default">
+        <div class="rank">Calibration (Brier)</div>
+        <div class="pick">{r['brier']}</div>
+        <div class="why">lower = better · 0.25 = coin-flip</div>
+      </div>
+      <div class="play" style="cursor:default">
+        <div class="rank">vs. pick-home baseline</div>
+        <div class="pick">{r['accuracy']}% / {r['pick_home_baseline']}%</div>
+        <div class="why">model vs. always-home</div>
+      </div>
+    </div>
+    <div class="tsub" style="margin-top:8px">Monthly: {esc(months)} &nbsp;·&nbsp;
+      updated {esc(r['generated'])}. Analysis only, not betting advice.</div>
+  </div>"""
+
+
 def nrfi_ranked_html(metas):
     """All games ranked by NRFI probability, highest first."""
     rows_m = [m for m in metas if m.get("nrfi")]
@@ -1564,7 +1598,7 @@ def build_html(games, records, team_stats, day, pitchers, bvp_map, bullpens,
         top = top_plays_html(metas, have_odds)
         ranked = ranked_table_html(metas, have_odds)
         nrfi_rank = nrfi_ranked_html(metas)
-        body = (top + ranked + nrfi_rank
+        body = (track_record_html() + top + ranked + nrfi_rank
                 + '<div class="games">\n' + "\n".join(cards) + "\n</div>")
 
     pretty = datetime.strptime(day, "%Y-%m-%d").strftime("%A, %B %-d, %Y")
