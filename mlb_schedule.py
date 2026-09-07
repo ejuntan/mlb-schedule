@@ -1273,6 +1273,7 @@ def game_card(game, records, team_stats, pitchers, bvp_map, bullpens, league,
         "market_dec": (o.get("pick_dec") if o else None),
         "min_dec": (o.get("min_dec") if o else None),
         "nrfi": pred.get("nrfi"),
+        "total": pred.get("exp_total"),
     }
 
     card = f"""
@@ -1557,7 +1558,9 @@ def log_day_picks(day, metas):
             "pick": m["pick"], "prob": m["pick_pct"],
             "nrfi_pct": (nr["pct"] if nr else None),
             "nrfi_lean": (("NRFI" if nr["pct"] >= 50 else "YRFI") if nr else None),
+            "total": m.get("total"),
             "result": None, "nrfi_result": None, "final": None,
+            "actual_total": None, "total_err": None,
         })
     log[day] = {"logged": datetime.now().strftime("%Y-%m-%d %H:%M"), "games": games}
     _save_picks(log)
@@ -1589,14 +1592,18 @@ def grade_pending_picks():
                     fi_runs = (inns[0].get("home", {}).get("runs", 0) or 0) + \
                               (inns[0].get("away", {}).get("runs", 0) or 0)
                 if hs is not None and as_ is not None:
-                    finals[pk] = (hn if hs > as_ else an, f"{as_}-{hs}", fi_runs)
+                    finals[pk] = (hn if hs > as_ else an, f"{as_}-{hs}",
+                                  fi_runs, hs + as_)
         for g in pending:
             fin = finals.get(g["gid"])
             if not fin:
                 continue
-            winner, score, fi_runs = fin
+            winner, score, fi_runs, actual_total = fin
             g["result"] = "win" if winner == g["pick"] else "loss"
             g["final"] = score
+            g["actual_total"] = actual_total
+            if g.get("total") is not None:
+                g["total_err"] = round(abs(g["total"] - actual_total), 2)
             if g["nrfi_lean"]:
                 nrfi_happened = fi_runs == 0
                 g["nrfi_result"] = "win" if (
@@ -1621,6 +1628,8 @@ def picks_record_html():
     n = len(graded)
     ng = [g for g in all_games if g["nrfi_result"]]
     nw = sum(1 for g in ng if g["nrfi_result"] == "win")
+    tg = [g for g in all_games if g.get("total_err") is not None]
+    tot_mae = (sum(g["total_err"] for g in tg) / len(tg)) if tg else None
     rec_txt = (f"{w}-{n-w} ({w/n*100:.0f}%) on {n} graded games"
                if n else "no games graded yet")
     pend_txt = f" · {pending} pending" if pending else ""
@@ -1643,11 +1652,13 @@ def picks_record_html():
 
     nrfi_line = (f" &nbsp;·&nbsp; NRFI leans {nw}-{len(ng)-nw}"
                  if ng else "")
+    tot_line = (f" &nbsp;·&nbsp; total-runs MAE {tot_mae:.2f} ({len(tg)} games)"
+                if tot_mae is not None else "")
     return f"""
   <div class="top" style="max-width:1100px">
     <h2>📊 Daily picks record</h2>
     <div class="tsub">Every day's straight-up picks, graded against MLB final
-      scores. {rec_txt}{pend_txt}{nrfi_line}.
+      scores. {rec_txt}{pend_txt}{nrfi_line}{tot_line}.
       Analysis only, not betting advice.</div>
     {recent}
   </div>"""
