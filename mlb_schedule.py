@@ -1613,13 +1613,17 @@ def picks_record_html():
     if not log:
         return ""
     all_games = [g for e in log.values() for g in e["games"]]
-    graded = [g for g in all_games if g["result"]]
-    if not graded:
+    if not all_games:
         return ""
+    graded = [g for g in all_games if g["result"]]
+    pending = sum(1 for g in all_games if not g["result"])
     w = sum(1 for g in graded if g["result"] == "win")
     n = len(graded)
     ng = [g for g in all_games if g["nrfi_result"]]
     nw = sum(1 for g in ng if g["nrfi_result"] == "win")
+    rec_txt = (f"{w}-{n-w} ({w/n*100:.0f}%) on {n} graded games"
+               if n else "no games graded yet")
+    pend_txt = f" · {pending} pending" if pending else ""
 
     # Most recent 2 logged days, most recent first
     days = sorted(log.keys(), reverse=True)[:2]
@@ -1643,7 +1647,7 @@ def picks_record_html():
   <div class="top" style="max-width:1100px">
     <h2>📊 Daily picks record</h2>
     <div class="tsub">Every day's straight-up picks, graded against MLB final
-      scores. {w}-{n-w} ({w/n*100:.0f}%) on {n} graded games{nrfi_line}.
+      scores. {rec_txt}{pend_txt}{nrfi_line}.
       Analysis only, not betting advice.</div>
     {recent}
   </div>"""
