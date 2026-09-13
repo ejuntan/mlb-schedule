@@ -5,8 +5,8 @@ nrfi.py — No-Run-First-Inning model, built on the same data feeds as the site.
 Estimates P(no run scored in the 1st inning by either team) using, per side:
   1. Actual top-3 hitter quality (posted lineup, else the team's 3 highest-wOBA
      regulars) — a top-of-order boost over team-average offense.
-  2. First-inning pitcher performance WITH SHRINKAGE — the starter's real 1st-
-     inning run rate (StatsAPI sitCode i01) regressed toward their K/BB/HR-based
+  2. First-inning pitcher performance WITH SHRINKAGE — the starter's CAREER 1st-
+     inning run rate (StatsAPI careerStatSplits i01) regressed toward their K/BB/HR-based
      talent and the league 1st-inning rate (small samples don't dominate).
   3. K/BB/HR pitcher profile — folded in via FIP, which the 1st-inning rate is
      shrunk toward.
@@ -41,6 +41,8 @@ gj = B.get_json
 # Calibration multiplier on scoring odds, fit by --backtest (1.0 = uncalibrated).
 # Fit on Jun 1-7 2025 (188 half-innings): model over-predicted scoring, so <1.
 CALIB = 0.90
+
+_FI_CACHE = {}  # (pid, season) -> fi_pitcher_rate result (backtest speedup)
 
 
 # --------------------------------------------------------------------------
@@ -85,8 +87,11 @@ def fi_pitcher_rate(pid, season, lg_era, lg_fi_runrate, cutoff=None):
     FIP-based talent (K/BB/HR), shrunk by sample size and toward league.
     `cutoff` (date) bounds the sample for point-in-time backtests.
     """
+    ck = (pid, season)
+    if ck in _FI_CACHE:
+        return _FI_CACHE[ck]
     url = (f"{STATS}/people/{pid}?hydrate=stats(group=[pitching],"
-           f"type=[statSplits],sitCodes=[i01],season={season})")
+           f"type=[careerStatSplits],sitCodes=[i01])")
     d = gj(url)
     fi_ip = fi_runs = 0.0
     if d and d.get("people"):
@@ -108,9 +113,11 @@ def fi_pitcher_rate(pid, season, lg_era, lg_fi_runrate, cutoff=None):
     K = 15.0  # innings of prior weight
     obs = fi_runs / fi_ip if fi_ip > 0 else talent_fi
     shrunk = (fi_runs + talent_fi * K) / (fi_ip + K)
-    return {"rate": shrunk, "fi_ip": fi_ip, "fi_runs": fi_runs, "obs": obs,
-            "talent9": talent9, "hand": (prof or {}).get("hand", "R"),
-            "name": (prof or {}).get("name", str(pid))}
+    res = {"rate": shrunk, "fi_ip": fi_ip, "fi_runs": fi_runs, "obs": obs,
+           "talent9": talent9, "hand": (prof or {}).get("hand", "R"),
+           "name": (prof or {}).get("name", str(pid))}
+    _FI_CACHE[ck] = res
+    return res
 
 
 # --------------------------------------------------------------------------
@@ -270,6 +277,11 @@ def run_backtest(start, end):
     season = int(start[:4])
     records = M.fetch_standings(season); ts = M.fetch_team_stats(season)
     lg = M.compute_league(records, ts)
+    _teams = gj(f"{STATS}/teams?sportId=1")
+    all_ids = [t["id"] for t in (_teams or {}).get("teams", [])]
+    HAND, LG_WOBA = M.fetch_team_hand_splits(season, all_ids)  # once
+    LGFI = league_first_inning((datetime.strptime(start,"%Y-%m-%d").date()
+                                - timedelta(days=21)).isoformat(), end)  # once
     rows = []  # (p_run_half, actual_run_0/1)
     dcur = datetime.strptime(start, "%Y-%m-%d").date()
     dend = datetime.strptime(end, "%Y-%m-%d").date()
@@ -277,8 +289,7 @@ def run_backtest(start, end):
         day = dcur.isoformat()
         d = gj(f"{STATS}/schedule?sportId=1&date={day}"
                f"&hydrate=probablePitcher,linescore,team")
-        lgfi = league_first_inning((dcur - timedelta(days=21)).isoformat(),
-                                   (dcur - timedelta(days=1)).isoformat())
+        lgfi = LGFI
         games = [g for dd in (d or {}).get("dates", []) for g in dd.get("games", [])
                  if g.get("status", {}).get("abstractGameState") == "Final"]
         for g in games:
@@ -289,10 +300,9 @@ def run_backtest(start, end):
             inns = g.get("linescore", {}).get("innings", [])
             if not (hsp and asp and inns):
                 continue
-            hand_splits, lg_woba = M.fetch_team_hand_splits(season, [hid, aid])
             park = model.park_factor(hid)
             r = nrfi_for_game(hid, aid, hsp, asp, season, lgfi, lg["ERA"],
-                              hand_splits, lg_woba, park)
+                              HAND, LG_WOBA, park)
             ah = inns[0].get("home", {}).get("runs")
             aa = inns[0].get("away", {}).get("runs")
             if ah is not None:

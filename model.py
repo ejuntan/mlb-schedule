@@ -90,7 +90,7 @@ def park_factor(home_team_id):
 # --------------------------------------------------------------------------
 # NRFI (no-run-first-inning) core — shared by nrfi.py and the site
 # --------------------------------------------------------------------------
-NRFI_CALIB = 0.90            # fit by nrfi.py --backtest (model over-predicts scoring)
+NRFI_CALIB = 0.89            # refit on 392 half-innings (career-i01 model)
 NRFI_SHRINK_K = 15.0         # innings of prior weight for 1st-inning shrinkage
 NRFI_TOP3_BOOST = 1.10       # default top-of-order boost when no lineup is posted
 

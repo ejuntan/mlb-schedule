@@ -303,7 +303,7 @@ def fetch_first_inning(pitcher_ids, season):
     """{pid: (fi_ip, fi_runs)} — each starter's 1st-inning line (sitCode i01)."""
     def load(pid):
         d = get_json(f"{STATS}/people/{pid}?hydrate=stats(group=[pitching],"
-                     f"type=[statSplits],sitCodes=[i01],season={season})")
+                     f"type=[careerStatSplits],sitCodes=[i01])")
         ip = runs = 0.0
         if d and d.get("people"):
             for grp in d["people"][0].get("stats", []):
