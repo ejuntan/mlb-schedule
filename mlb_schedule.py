@@ -1614,53 +1614,47 @@ def grade_pending_picks():
     return log
 
 
-def picks_record_html():
-    """Banner + recent daily picks, graded against MLB finals."""
+def picks_record_html(day):
+    """Banner + graded picks for the SELECTED day only."""
     log = _load_picks()
-    if not log:
+    entry = log.get(day)
+    if not entry or not entry.get("games"):
         return ""
-    all_games = [g for e in log.values() for g in e["games"]]
-    if not all_games:
-        return ""
-    graded = [g for g in all_games if g["result"]]
-    pending = sum(1 for g in all_games if not g["result"])
+    games = entry["games"]
+    graded = [g for g in games if g["result"]]
+    pending = sum(1 for g in games if not g["result"])
     w = sum(1 for g in graded if g["result"] == "win")
     n = len(graded)
-    ng = [g for g in all_games if g["nrfi_result"]]
+    ng = [g for g in games if g["nrfi_result"]]
     nw = sum(1 for g in ng if g["nrfi_result"] == "win")
-    tg = [g for g in all_games if g.get("total_err") is not None]
+    tg = [g for g in games if g.get("total_err") is not None]
     tot_mae = (sum(g["total_err"] for g in tg) / len(tg)) if tg else None
     rec_txt = (f"{w}-{n-w} ({w/n*100:.0f}%) on {n} graded games"
                if n else "no games graded yet")
     pend_txt = f" · {pending} pending" if pending else ""
 
-    # Most recent 2 logged days, most recent first
-    days = sorted(log.keys(), reverse=True)[:2]
-    recent = ""
-    for day in days:
-        chips = ""
-        for g in log[day]["games"]:
-            if g["result"] == "win":
-                cls, mark = "val-yes", "✓"
-            elif g["result"] == "loss":
-                cls, mark = "val-no", "✗"
-            else:
-                cls, mark = "", "·"
-            chips += (f'<span class="pick-chip {cls}">{mark} {esc(g["pick"])}'
-                      f' {g["prob"]}%</span>')
-        recent += (f'<div class="pick-day"><b>{esc(day)}</b> {chips}</div>')
+    chips = ""
+    for g in games:
+        if g["result"] == "win":
+            cls, mark = "val-yes", "\u2713"
+        elif g["result"] == "loss":
+            cls, mark = "val-no", "\u2717"
+        else:
+            cls, mark = "", "\u00b7"
+        chips += (f'<span class="pick-chip {cls}">{mark} {esc(g["pick"])}'
+                  f' {g["prob"]}%</span>')
 
-    nrfi_line = (f" &nbsp;·&nbsp; NRFI leans {nw}-{len(ng)-nw}"
+    nrfi_line = (f" &nbsp;\u00b7&nbsp; NRFI leans {nw}-{len(ng)-nw}"
                  if ng else "")
-    tot_line = (f" &nbsp;·&nbsp; total-runs MAE {tot_mae:.2f} ({len(tg)} games)"
+    tot_line = (f" &nbsp;\u00b7&nbsp; total-runs MAE {tot_mae:.2f} ({len(tg)} games)"
                 if tot_mae is not None else "")
     return f"""
   <div class="top" style="max-width:1100px">
-    <h2>📊 Daily picks record</h2>
-    <div class="tsub">Every day's straight-up picks, graded against MLB final
+    <h2>\U0001F4CA Picks record — {esc(day)}</h2>
+    <div class="tsub">This day's straight-up picks, graded against MLB final
       scores. {rec_txt}{pend_txt}{nrfi_line}{tot_line}.
       Analysis only, not betting advice.</div>
-    {recent}
+    <div class="pick-day">{chips}</div>
   </div>"""
 
 
@@ -1711,7 +1705,7 @@ def build_html(games, records, team_stats, day, pitchers, bvp_map, bullpens,
         # Record this day's picks (once) and grade any picks now Final.
         log_day_picks(day, metas)
         grade_pending_picks()
-        body = (picks_record_html() + top + ranked + nrfi_rank
+        body = (picks_record_html(day) + top + ranked + nrfi_rank
                 + '<div class="games">\n' + "\n".join(cards) + "\n</div>")
 
     pretty = datetime.strptime(day, "%Y-%m-%d").strftime("%A, %B %-d, %Y")
