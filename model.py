@@ -80,6 +80,11 @@ DEFAULT_CFG = {
     "max_runs": 26,          # support of the run distribution
     "park_strength": 1.0,    # 0..1 scaling of park effect
     "clamp": (0.03, 0.97),   # win-prob clamp
+    # Totals: means run ~0.28/game LOW in mean, but that is a MEAN bias and MAE
+    # is minimised at the median — a x1.033 rescale zeroed the bias yet made MAE
+    # slightly WORSE (3.607->3.632 full, tested on 1817 games 2025). So we leave
+    # the scale at 1.0. Knob kept for future sweeps; do not "fix" the mean bias.
+    "total_scale": 1.0,
 }
 
 
@@ -479,6 +484,12 @@ def predict(home, away, ctx, cfg=None):
     lam_away = lg_r * off_mult(away) * (def_home / lg_r) * pf_mult
     lam_home = max(1.2, lam_home) + cfg["hfa_runs"]
     lam_away = max(1.2, lam_away)
+
+    # Totals de-bias: scale both means equally (leaves win prob ~unchanged).
+    ts = cfg.get("total_scale", 1.0)
+    if ts != 1.0:
+        lam_home *= ts
+        lam_away *= ts
 
     kmax = cfg["max_runs"]
     disp = cfg["dispersion"]

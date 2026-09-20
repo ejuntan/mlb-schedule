@@ -1,0 +1,33 @@
+================================================================================
+ TOTALS (OVER/UNDER) BACKTEST   1817 games with a market total
+================================================================================
+
+(1) PREDICTIVE — is the model's total closer to reality than the line?
+    model  MAE 3.607   bias -0.280 runs
+    market MAE 3.527   (closing line vs actual)
+    open   MAE 3.566
+    scale x1.000: MAE 3.607 bias -0.280  | train MAE 3.648  test MAE 3.517
+    scale x1.033: MAE 3.632 bias +0.001  | train MAE 3.681  test MAE 3.526
+    -> model MAE < market MAE means the model knows something the line doesn't.
+
+(2) DIRECTIONAL — bet model's side vs CLOSING line, by disagreement size:
+    (need ~52.4% to beat -110 vig)
+    |edge|>=0.0r : 1817 bets (36 push)  W 895 (50.3%)  units  -79.75  ROI  -4.4%
+    |edge|>=0.5r :  972 bets (20 push)  W 465 (48.8%)  units  -68.96  ROI  -7.1%
+    |edge|>=1.0r :  378 bets (10 push)  W 170 (46.2%)  units  -44.95  ROI -11.9%
+    |edge|>=1.5r :  126 bets (4 push)  W 53 (43.4%)  units  -21.50  ROI -17.1%
+    |edge|>=2.0r :   48 bets (3 push)  W 15 (33.3%)  units  -16.36  ROI -34.1%
+
+(3) CLV — bet model's side at OPEN, did the line move our way by close?
+    |edge|>=0.0r : 1817 bets  moved-our-way 699/1817 (38.5%)  avg line move -0.034r (+=our way)
+    |edge|>=0.5r :  883 bets  moved-our-way 327/883 (37.0%)  avg line move -0.049r (+=our way)
+    |edge|>=1.0r :  306 bets  moved-our-way 111/306 (36.3%)  avg line move -0.076r (+=our way)
+
+    Out-of-sample check (split 2025-07-01, |edge|>=1.0r):
+      train:  274 bets  W 45.9%  ROI -12.5%   | CLV beat 35.3% (232 bets)
+      test :  104 bets  W 47.0%  ROI -10.3%   | CLV beat 39.2% (74 bets)
+
+================================================================================
+ Model MAE vs market MAE is the honest headline; directional ROI on small
+ samples is noisy, CLV converges faster. Not betting advice.
+================================================================================
