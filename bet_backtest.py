@@ -219,6 +219,40 @@ def summarize(r, label):
             f"units {r['units']:+7.2f}  ROI {r['roi']*100:+5.1f}%")
 
 
+def clv_stats(bets, edge_min=0.0):
+    """Closing-line value for bets we'd place: pick where the model has positive
+    edge at the OPENING consensus price, then compare that price to the CLOSING
+    consensus price. Beating the close (getting longer odds than it settled at)
+    is the fastest-converging evidence of genuine edge — it stabilises in ~100s
+    of bets where ROI needs 1000s. Returns beat-close rate + average CLV."""
+    n = beat = 0
+    clv_prob = clv_ret = 0.0
+    for b in bets:
+        od = b["prices"][("open", "cons")]
+        cd = b["prices"][("close", "cons")]
+        if not od or not cd:
+            continue
+        if b["p_pick"] - (1.0 / od) < edge_min:   # only bets we'd actually make
+            continue
+        n += 1
+        if od > cd:                                # longer odds than the close
+            beat += 1
+        clv_prob += (1.0 / cd) - (1.0 / od)        # probability points gained
+        clv_ret += (od / cd) - 1.0                 # return vs the close
+    if not n:
+        return {"n": 0, "beat": 0, "beat_pct": 0.0, "clv_pp": 0.0, "clv_ret": 0.0}
+    return {"n": n, "beat": beat, "beat_pct": 100 * beat / n,
+            "clv_pp": 100 * clv_prob / n, "clv_ret": 100 * clv_ret / n}
+
+
+def summarize_clv(c, label):
+    if not c["n"]:
+        return f"  {label:<34} (no bets)"
+    return (f"  {label:<34} bets {c['n']:4d}  "
+            f"beat-close {c['beat']}/{c['n']} ({c['beat_pct']:4.1f}%)  "
+            f"avg CLV {c['clv_pp']:+.2f}pp / {c['clv_ret']:+.2f}%")
+
+
 def report(bets, split, out):
     train = [b for b in bets if b["date"] < split]
     test = [b for b in bets if b["date"] >= split]
@@ -249,9 +283,18 @@ def report(bets, split, out):
         print(summarize(te, "  -> on TEST (out-of-sample)"))
         full = eval_strategy(bets, line, price, edge)
         print(summarize(full, "  -> on FULL range"))
+
+    # Closing-line value: the fast-converging edge signal (beat-close > 50% and
+    # positive avg CLV = genuine skill, long before ROI is statistically stable).
+    print("\n CLOSING-LINE VALUE (bet open cons where edge>0, vs the close):")
+    print(summarize_clv(clv_stats(bets), "  full range"))
+    print(summarize_clv(clv_stats(train), "  train half"))
+    print(summarize_clv(clv_stats(test), "  test half (out-of-sample)"))
+    print(summarize_clv(clv_stats(bets, edge_min=0.03), "  stronger picks (edge>=3%)"))
     print("=" * 78)
     print(" Real closing/opening moneylines. Best config is picked on train and"
-          " shown out-of-sample on test to avoid curve-fitting. Not betting advice.\n")
+          " shown out-of-sample on test to avoid curve-fitting. CLV beat-close% is"
+          " the metric to trust on small samples. Not betting advice.\n")
 
     if out:
         write_html(bets, naive, grid, split, out)
@@ -260,6 +303,20 @@ def report(bets, split, out):
 def write_html(bets, naive, grid, split, out):
     train = [b for b in bets if b["date"] < split]
     test = [b for b in bets if b["date"] >= split]
+    clv_full = clv_stats(bets)
+    clv_test = clv_stats(test)
+    clv_cls = "pos" if clv_full["beat_pct"] >= 50 else "neg"
+    clv_card = (
+        f'<div class=card><b>Closing-line value</b> — the fast-converging edge '
+        f'signal (stabilises in ~100s of bets, not 1000s).'
+        f'<div class="big {clv_cls}">{clv_full["beat_pct"]:.0f}% beat the close</div>'
+        f'<div class=k>full range: {clv_full["beat"]}/{clv_full["n"]} bets got a '
+        f'longer price than the closing line · avg CLV '
+        f'<b class="{clv_cls}">{clv_full["clv_pp"]:+.2f}pp</b> '
+        f'({clv_full["clv_ret"]:+.2f}% return). '
+        f'Out-of-sample test half: <b>{clv_test["beat_pct"]:.0f}%</b> beat-close '
+        f'over {clv_test["n"]} bets. Beating the close &gt; 50% is genuine skill; '
+        f'it&rsquo;s the metric to trust while ROI samples are small.</div></div>')
     rows = ""
     for (line, price, edge), r in grid[:8]:
         te = eval_strategy(test, line, price, edge)
@@ -291,6 +348,7 @@ th{{color:#8b949e}}.k{{color:#8b949e}}.big{{font-size:30px;font-weight:700;margi
 <b class="{'neg' if naive['units']<0 else 'pos'}">{naive['units']:+.1f}u</b>
 (ROI {naive['roi']*100:+.1f}%, {naive['n']} bets) — the flat-betting result we're trying to beat.</div>
 <div class=card>{hero}</div>
+{clv_card}
 <div class=card><b>Strategies</b> — chosen on train, verified on test
 <table><tr><th>Strategy</th><th>train n</th><th>train ROI</th>
 <th>test n</th><th>test ROI</th><th>test units</th></tr>{rows}</table></div>
