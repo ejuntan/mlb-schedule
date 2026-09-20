@@ -137,8 +137,14 @@ def _woba_for(pid, season):
     return None, 0
 
 
+_TOP3_CACHE = {}   # (team_id, season, lineup_key) -> (boost, ids); backtest speedup
+
+
 def top3_boost(team_id, season, lineup_ids, team_woba, lg_woba):
     """avg wOBA of the top-3 hitters / team-average wOBA (clamped)."""
+    ck = (team_id, season, tuple(lineup_ids or ()))
+    if ck in _TOP3_CACHE:
+        return _TOP3_CACHE[ck]
     ids = lineup_ids
     if not ids:
         # Fallback: the team's 3 highest-wOBA regulars (>=150 PA).
@@ -154,15 +160,18 @@ def top3_boost(team_id, season, lineup_ids, team_woba, lg_woba):
         cand.sort(reverse=True)
         ids = [pid for _, pid in cand[:3]]
     if not ids:
-        return 1.0, []
+        _TOP3_CACHE[ck] = (1.0, [])
+        return _TOP3_CACHE[ck]
     with ThreadPoolExecutor(max_workers=6) as ex:
         res = list(ex.map(lambda x: _woba_for(x, season), ids))
     wobas = [w for w, _ in res if w]
     if not wobas:
-        return 1.0, ids
+        _TOP3_CACHE[ck] = (1.0, ids)
+        return _TOP3_CACHE[ck]
     avg = sum(wobas) / len(wobas)
     base = team_woba or lg_woba
-    return max(0.85, min(1.30, avg / base)), ids
+    _TOP3_CACHE[ck] = (max(0.85, min(1.30, avg / base)), ids)
+    return _TOP3_CACHE[ck]
 
 
 # --------------------------------------------------------------------------

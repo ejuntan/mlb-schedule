@@ -605,6 +605,44 @@ def fetch_roster(team_id):
     return ids, pitchers
 
 
+def fetch_top3_boosts(team_ids, season):
+    """Per-team NRFI top-of-order boost = (avg wOBA of the 3 best hitters) /
+    (team's PA-weighted wOBA), clamped. The 1st inning faces the top of the
+    order, who are better than the team average — this replaces the old fixed
+    1.10 assumption with each team's real top-3 quality. One hydrated roster
+    call per team (all hitters' season wOBA in a single request), threaded."""
+    def one(tid):
+        url = (f"{STATS}/teams/{tid}/roster?rosterType=active"
+               f"&hydrate=person(stats(group=[hitting],type=[season],"
+               f"season={season}))")
+        d = get_json(url)
+        hitters = []   # (woba, pa)
+        for p in (d or {}).get("roster", []):
+            if p.get("position", {}).get("abbreviation") == "P":
+                continue
+            for grp in p.get("person", {}).get("stats", []):
+                for s in grp.get("splits", []):
+                    st = s.get("stat", {})
+                    w = model.calc_woba(st)
+                    pa = model._num(st, "plateAppearances")
+                    if w and pa:
+                        hitters.append((w, pa))
+        if not hitters:
+            return tid, model.NRFI_TOP3_BOOST     # fall back to the constant
+        tw = sum(w * pa for w, pa in hitters) / sum(pa for _, pa in hitters)
+        qualified = [h for h in hitters if h[1] >= 50] or hitters
+        top = sorted(qualified, reverse=True)[:3]
+        avg3 = sum(w for w, _ in top) / len(top)
+        if not tw:
+            return tid, model.NRFI_TOP3_BOOST
+        return tid, max(0.85, min(1.30, avg3 / tw))
+    out = {}
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for tid, boost in ex.map(one, team_ids):
+            out[tid] = boost
+    return out
+
+
 # ---------------------------------------------------------------------------
 # StatsAPI: batter-vs-pitcher (whole opposing team in one call)
 # ---------------------------------------------------------------------------
@@ -1229,11 +1267,14 @@ def game_card(game, records, team_stats, pitchers, bvp_map, bullpens, league,
         a_ip, a_r = fi.get(away_pid, (0, 0))
         home_fi = model.fi_shrink_rate(h_r, h_ip, home_feat["sp_ra"], lg_era, rr)
         away_fi = model.fi_shrink_rate(a_r, a_ip, away_feat["sp_ra"], lg_era, rr)
-        boost = model.NRFI_TOP3_BOOST
+        # Real top-of-order quality per team (falls back to the constant).
+        top3 = nrfi_ctx.get("top3", {})
+        home_boost = top3.get(home_id, model.NRFI_TOP3_BOOST)
+        away_boost = top3.get(away_id, model.NRFI_TOP3_BOOST)
         # Home offense faces away SP; away offense faces home SP.
-        ph = model.team_pscore_1st(home_feat["off_mult"] or 1.0, boost, away_fi,
+        ph = model.team_pscore_1st(home_feat["off_mult"] or 1.0, home_boost, away_fi,
                                    lgfi["p_score"], rr, park)
-        pa = model.team_pscore_1st(away_feat["off_mult"] or 1.0, boost, home_fi,
+        pa = model.team_pscore_1st(away_feat["off_mult"] or 1.0, away_boost, home_fi,
                                    lgfi["p_score"], rr, park)
         nrfi = model.nrfi_prob(ph, pa)
         pred["nrfi"] = {"pct": round(nrfi * 100), "yrfi": round((1 - nrfi) * 100),
@@ -1880,7 +1921,8 @@ def generate_page(day, force=False):
     recency = {"pit": fetch_recent_pitching(day), "general": general_mult}
     starter_ids = [pid for pid in pitcher_jobs]
     nrfi_ctx = {"fi": fetch_first_inning(starter_ids, season),
-                "lgfi": fetch_league_first_inning(day)}
+                "lgfi": fetch_league_first_inning(day),
+                "top3": fetch_top3_boosts(team_ids, season)}
     # The live odds API only has UPCOMING games, so only spend a credit for
     # today's slate; other dates never call it (conserves the free quota).
     odds_map = odds.fetch_odds(day) if day == date.today().isoformat() else {}

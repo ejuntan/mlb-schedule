@@ -95,9 +95,14 @@ def park_factor(home_team_id):
 # --------------------------------------------------------------------------
 # NRFI (no-run-first-inning) core — shared by nrfi.py and the site
 # --------------------------------------------------------------------------
-NRFI_CALIB = 0.89            # refit on 392 half-innings (career-i01 model)
+# Recalibrated when the site moved from a fixed 1.10 top-3 boost to REAL per-team
+# top-3 quality (league-avg boost measured at 1.128 across 30 teams, 2025). Holding
+# the league-average scoring level fixed: 0.89 * 1.10 / 1.128 = 0.868, so the
+# validated aggregate calibration is preserved while per-team boosts now move the
+# relative NRFI between games (weak tops ~1.03, stacked ~1.20).
+NRFI_CALIB = 0.868
 NRFI_SHRINK_K = 15.0         # innings of prior weight for 1st-inning shrinkage
-NRFI_TOP3_BOOST = 1.10       # default top-of-order boost when no lineup is posted
+NRFI_TOP3_BOOST = 1.10       # fallback boost only when a team's hitters can't be fetched
 
 
 def fi_shrink_rate(fi_runs, fi_ip, talent9, lg_era, lg_runs_per_half,
