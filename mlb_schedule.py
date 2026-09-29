@@ -56,6 +56,9 @@ import odds   # optional live odds / value layer (dormant without ODDS_API_KEY)
 STATS = "https://statsapi.mlb.com/api/v1"
 SAVANT = "https://baseballsavant.mlb.com"
 SPORT_ID = 1  # MLB
+# StatsAPI gameType codes for the postseason (F=wild card, D=division series,
+# L=league championship, W=World Series; P is a legacy generic playoff code).
+POSTSEASON_TYPES = {"F", "D", "L", "W", "P"}
 UA = "mlb-schedule-script/2.0 (+https://statsapi.mlb.com)"
 
 
@@ -147,7 +150,7 @@ def pct(v):
 # ---------------------------------------------------------------------------
 
 def fetch_schedule(day):
-    hydrate = "probablePitcher(note),linescore,team,person,venue,weather"
+    hydrate = "probablePitcher(note),linescore,team,person,venue,weather,lineups"
     url = f"{STATS}/schedule?sportId={SPORT_ID}&date={day}&hydrate={hydrate}"
     data = get_json(url)
     if not data:
@@ -605,21 +608,48 @@ def fetch_roster(team_id):
     return ids, pitchers
 
 
+def extract_lineups(games):
+    """Posted batting orders per game: {gamePk: {"home":[pid...], "away":[pid...]}}.
+    Playoff lineups are posted pre-game and matchup-optimised; empty until posted."""
+    out = {}
+    for g in games:
+        lu = g.get("lineups") or {}
+        home = [p.get("id") for p in lu.get("homePlayers", []) if p.get("id")]
+        away = [p.get("id") for p in lu.get("awayPlayers", []) if p.get("id")]
+        if home or away:
+            out[g.get("gamePk")] = {"home": home, "away": away}
+    return out
+
+
+def top3_boost_from(wobas, team_woba):
+    """Boost = avg wOBA of up to 3 given hitters / team wOBA, clamped."""
+    ws = [w for w in wobas if w]
+    if not ws or not team_woba:
+        return None
+    avg = sum(ws[:3]) / len(ws[:3])
+    return max(0.85, min(1.30, avg / team_woba))
+
+
 def fetch_top3_boosts(team_ids, season):
-    """Per-team NRFI top-of-order boost = (avg wOBA of the 3 best hitters) /
-    (team's PA-weighted wOBA), clamped. The 1st inning faces the top of the
-    order, who are better than the team average — this replaces the old fixed
-    1.10 assumption with each team's real top-3 quality. One hydrated roster
-    call per team (all hitters' season wOBA in a single request), threaded."""
+    """Per team: NRFI top-of-order boost + the pieces needed to recompute it from
+    a posted playoff lineup. Boost = (avg wOBA of the 3 best hitters) / (team's
+    PA-weighted wOBA), clamped. The 1st inning faces the top of the order, who
+    beat the team average — this replaced the old fixed 1.10 with real top-3
+    quality. One hydrated roster call per team (all hitters' season wOBA), threaded.
+
+    Returns {tid: {"boost": float, "team_woba": float, "wobas": {pid: woba}}}.
+    """
     def one(tid):
         url = (f"{STATS}/teams/{tid}/roster?rosterType=active"
                f"&hydrate=person(stats(group=[hitting],type=[season],"
                f"season={season}))")
         d = get_json(url)
-        hitters = []   # (woba, pa)
+        hitters = []              # (woba, pa)
+        by_pid = {}               # pid -> woba
         for p in (d or {}).get("roster", []):
             if p.get("position", {}).get("abbreviation") == "P":
                 continue
+            pid = p.get("person", {}).get("id")
             for grp in p.get("person", {}).get("stats", []):
                 for s in grp.get("splits", []):
                     st = s.get("stat", {})
@@ -627,19 +657,21 @@ def fetch_top3_boosts(team_ids, season):
                     pa = model._num(st, "plateAppearances")
                     if w and pa:
                         hitters.append((w, pa))
+                        if pid:
+                            by_pid[pid] = w
         if not hitters:
-            return tid, model.NRFI_TOP3_BOOST     # fall back to the constant
+            return tid, {"boost": model.NRFI_TOP3_BOOST, "team_woba": None,
+                         "wobas": {}}
         tw = sum(w * pa for w, pa in hitters) / sum(pa for _, pa in hitters)
         qualified = [h for h in hitters if h[1] >= 50] or hitters
         top = sorted(qualified, reverse=True)[:3]
         avg3 = sum(w for w, _ in top) / len(top)
-        if not tw:
-            return tid, model.NRFI_TOP3_BOOST
-        return tid, max(0.85, min(1.30, avg3 / tw))
+        boost = (max(0.85, min(1.30, avg3 / tw)) if tw else model.NRFI_TOP3_BOOST)
+        return tid, {"boost": boost, "team_woba": tw, "wobas": by_pid}
     out = {}
     with ThreadPoolExecutor(max_workers=8) as ex:
-        for tid, boost in ex.map(one, team_ids):
-            out[tid] = boost
+        for tid, info in ex.map(one, team_ids):
+            out[tid] = info
     return out
 
 
@@ -902,13 +934,15 @@ def _season_run_env(rec):
 
 
 def build_features(rec, pitcher, sp_pid, pen, hand_split, opp_hand, lg,
-                   team_id, recency):
+                   team_id, recency, cfg=None):
     """Assemble one team's feature dict for model.predict().
 
     `recency` = {"pit": {pid:{era,fip,ip}} last 30d, "off": {tid: factor}}.
     Starter and reliever talent blend season with last-30-day form (regressed);
     offense wOBA is nudged by the team's recent-form multiplier.
+    `cfg` selects regular-season vs playoff behaviour (starter IP, bullpen).
     """
+    cfg = cfg or model.DEFAULT_CFG
     lg_era = lg["ERA"]
     opp_hand = opp_hand if opp_hand in ("R", "L") else "R"
     rpit = (recency or {}).get("pit", {})
@@ -937,11 +971,12 @@ def build_features(rec, pitcher, sp_pid, pen, hand_split, opp_hand, lg,
                     if rp else None)
         sp_ra = model.recency_blend(season_t, model.ip_to_float(pitcher["ip"]),
                                     recent_t, rp["ip"] if rp else 0, lg_era, K_IP)
-        proj_ip = model._project_ip(pitcher["ip"], pitcher["gs"], model.DEFAULT_CFG)
+        proj_ip = model._project_ip(pitcher["ip"], pitcher["gs"], cfg)
     else:
-        sp_ra, proj_ip = lg_era + 0.25, 4.5
+        sp_ra, proj_ip = lg_era + 0.25, 4.5 * cfg.get("sp_ip_mult", 1.0)
 
     # Bullpen: season+L30 talent x availability x expected usage.
+    fresh = cfg.get("pen_fresh_boost", 0.0)   # playoff off-days -> softer fatigue
     arms = []
     for r in (pen or []):
         season_t = model.reliever_true_talent(r["fip"], r["xfip"], r["xera"],
@@ -951,9 +986,14 @@ def build_features(rec, pitcher, sp_pid, pen, hand_split, opp_hand, lg,
                     if rp else None)
         talent = model.recency_blend(season_t, model.ip_to_float(r["ip"]),
                                      recent_t, rp["ip"] if rp else 0, lg_era, K_IP)
-        arms.append({"talent": talent, "avail": r["fat"]["avail"],
+        avail = r["fat"]["avail"]
+        if fresh:                              # cut the fatigue penalty toward 1.0
+            avail = avail + (1.0 - avail) * fresh
+        arms.append({"talent": talent, "avail": avail,
                      "usage": r.get("usage", 1.0)})
-    pen_ra = model.bullpen_run_prevention(arms, lg_era)
+    pen_ra = model.bullpen_run_prevention(
+        arms, lg_era, top_heavy=cfg.get("pen_top_heavy", False),
+        top_n=cfg.get("pen_top_n", 5))
 
     return {"off_mult": off_mult, "off_woba": base_woba,
             "lg_off_woba": lg_off_woba, "off_fallback": off.get("fallback", False),
@@ -961,15 +1001,24 @@ def build_features(rec, pitcher, sp_pid, pen, hand_split, opp_hand, lg,
             "rspg": rspg, "rapg": rapg, "off_ops": off.get("ops")}
 
 
-def compute_league(records, team_stats):
-    """League runs/game and ERA baselines from all teams' season data."""
+def compute_league(records, team_stats, only_ids=None):
+    """League runs/game and ERA baselines from season data.
+
+    only_ids (playoffs): restrict the baseline to those team ids, so the run
+    environment reflects elite-vs-elite postseason play rather than a 30-team
+    average that includes non-contenders.
+    """
+    ids = set(only_ids) if only_ids else None
     rspg = []
-    for r in records.values():
+    for tid, r in records.items():
+        if ids and tid not in ids:
+            continue
         rs_pg, _ = _season_run_env(r)
         if rs_pg:
             rspg.append(rs_pg)
-    eras = [v for v in (_f(t.get("team_era")) for t in team_stats.values())
-            if v is not None]
+    eras = [v for tid, t in team_stats.items()
+            if (not ids or tid in ids)
+            for v in (_f(t.get("team_era")),) if v is not None]
     lg_r = sum(rspg) / len(rspg) if rspg else 4.4
     lg_era = sum(eras) / len(eras) if eras else 4.15
     return {"R": lg_r, "ERA": lg_era}
@@ -1199,7 +1248,8 @@ def prediction_html(pred, drv, away_name, home_name):
 
 
 def game_card(game, records, team_stats, pitchers, bvp_map, bullpens, league,
-              hand_splits, recency, odds_map, nrfi_ctx):
+              hand_splits, recency, odds_map, nrfi_ctx, cfg=None):
+    cfg = cfg or model.DEFAULT_CFG
     teams = game.get("teams", {})
     home_t = teams.get("home", {}).get("team", {})
     away_t = teams.get("away", {}).get("team", {})
@@ -1246,13 +1296,13 @@ def game_card(game, records, team_stats, pitchers, bvp_map, bullpens, league,
     # Home offense faces the AWAY starter's hand; away offense faces HOME's.
     home_feat = build_features(rec_for("home", home_id), home_pitcher, home_pid,
                                home_pen, hand_splits.get(home_id), away_hand,
-                               league, home_id, recency)
+                               league, home_id, recency, cfg)
     away_feat = build_features(rec_for("away", away_id), away_pitcher, away_pid,
                                away_pen, hand_splits.get(away_id), home_hand,
-                               league, away_id, recency)
+                               league, away_id, recency, cfg)
     park = model.park_factor(home_id)
     ctx = {"lg_r": league["R"], "park_factor": park}
-    pred = model.predict(home_feat, away_feat, ctx)
+    pred = model.predict(home_feat, away_feat, ctx, cfg)
     pred["odds"] = odds.evaluate(pred["p_home_raw"],
                                  odds_map.get((home_id, away_id))) if odds_map else None
 
@@ -1267,10 +1317,24 @@ def game_card(game, records, team_stats, pitchers, bvp_map, bullpens, league,
         a_ip, a_r = fi.get(away_pid, (0, 0))
         home_fi = model.fi_shrink_rate(h_r, h_ip, home_feat["sp_ra"], lg_era, rr)
         away_fi = model.fi_shrink_rate(a_r, a_ip, away_feat["sp_ra"], lg_era, rr)
-        # Real top-of-order quality per team (falls back to the constant).
+        # Real top-of-order quality per team; use the POSTED lineup's top 3 when
+        # available (playoff lineups are set + matchup-optimised), else season top-3.
         top3 = nrfi_ctx.get("top3", {})
-        home_boost = top3.get(home_id, model.NRFI_TOP3_BOOST)
-        away_boost = top3.get(away_id, model.NRFI_TOP3_BOOST)
+        lu = (nrfi_ctx.get("lineups") or {}).get(game.get("gamePk"), {})
+
+        def nrfi_boost(tid, order):
+            entry = top3.get(tid)
+            if not isinstance(entry, dict):
+                return model.NRFI_TOP3_BOOST
+            if order and entry.get("team_woba"):
+                ws = [entry["wobas"].get(pid) for pid in order[:3]]
+                b = top3_boost_from([w for w in ws if w], entry["team_woba"])
+                if b is not None:
+                    return b
+            return entry.get("boost", model.NRFI_TOP3_BOOST)
+
+        home_boost = nrfi_boost(home_id, lu.get("home"))
+        away_boost = nrfi_boost(away_id, lu.get("away"))
         # Home offense faces away SP; away offense faces home SP.
         ph = model.team_pscore_1st(home_feat["off_mult"] or 1.0, home_boost, away_fi,
                                    lgfi["p_score"], rr, park)
@@ -1728,7 +1792,7 @@ def nrfi_ranked_html(metas):
 
 
 def build_html(games, records, team_stats, day, pitchers, bvp_map, bullpens,
-               league, hand_splits, recency, odds_map, nrfi_ctx):
+               league, hand_splits, recency, odds_map, nrfi_ctx, cfg=None):
     if not games:
         body = '<div class="empty">No MLB games scheduled for this date.</div>'
     else:
@@ -1736,7 +1800,7 @@ def build_html(games, records, team_stats, day, pitchers, bvp_map, bullpens,
         for g in games:
             card, meta = game_card(g, records, team_stats, pitchers, bvp_map,
                                    bullpens, league, hand_splits, recency,
-                                   odds_map, nrfi_ctx)
+                                   odds_map, nrfi_ctx, cfg)
             cards.append(card)
             metas.append(meta)
         have_odds = bool(odds_map)
@@ -1920,9 +1984,19 @@ def generate_page(day, force=False):
     general_mult, _ = fetch_offense_windows(day, season)
     recency = {"pit": fetch_recent_pitching(day), "general": general_mult}
     starter_ids = [pid for pid in pitcher_jobs]
+    # Playoff mode: October baseball has a quick hook, fresh top-heavy bullpens,
+    # elite-vs-elite run environment, and posted matchup lineups. Detect it from
+    # the slate's gameType and switch the model config + baselines accordingly.
+    playoff = bool(games) and all(
+        g.get("gameType") in POSTSEASON_TYPES for g in games)
+    cfg = model.PLAYOFF_CFG if playoff else model.DEFAULT_CFG
+    if playoff:
+        print("      POSTSEASON slate — playoff model (quick hook, fresh/top-heavy "
+              "pen, elite baselines, posted lineups).")
     nrfi_ctx = {"fi": fetch_first_inning(starter_ids, season),
                 "lgfi": fetch_league_first_inning(day),
-                "top3": fetch_top3_boosts(team_ids, season)}
+                "top3": fetch_top3_boosts(team_ids, season),
+                "lineups": extract_lineups(games)}
     # The live odds API only has UPCOMING games, so only spend a credit for
     # today's slate; other dates never call it (conserves the free quota).
     odds_map = odds.fetch_odds(day) if day == date.today().isoformat() else {}
@@ -1930,10 +2004,11 @@ def generate_page(day, force=False):
         print(f"      live odds for {len(odds_map)} games.")
 
     print("Building page ...")
-    league = compute_league(records, team_stats)
+    # Playoffs: baseline the run environment on the contending teams only.
+    league = compute_league(records, team_stats, only_ids=team_ids if playoff else None)
     league["woba"] = lg_woba
     page = build_html(games, records, team_stats, day, pitchers, bvp_map,
-                      bullpens, league, hand_splits, recency, odds_map, nrfi_ctx)
+                      bullpens, league, hand_splits, recency, odds_map, nrfi_ctx, cfg)
     _PAGE_CACHE[day] = (time.time(), page)
     return page
 

@@ -80,11 +80,29 @@ DEFAULT_CFG = {
     "max_runs": 26,          # support of the run distribution
     "park_strength": 1.0,    # 0..1 scaling of park effect
     "clamp": (0.03, 0.97),   # win-prob clamp
+    # Playoff knobs (1.0 / 0.0 / False = regular-season behaviour):
+    "sp_ip_mult": 1.0,       # scale projected starter innings (playoffs: quick hook)
+    "pen_fresh_boost": 0.0,  # 0..1: how much to cut the fatigue penalty (off-days)
+    "pen_top_heavy": False,  # bullpen = only the best arms (leverage usage)
+    "pen_top_n": 5,          # how many arms actually pitch in a playoff game
     # Totals: means run ~0.28/game LOW in mean, but that is a MEAN bias and MAE
     # is minimised at the median — a x1.033 rescale zeroed the bias yet made MAE
     # slightly WORSE (3.607->3.632 full, tested on 1817 games 2025). So we leave
     # the scale at 1.0. Knob kept for future sweeps; do not "fix" the mean bias.
     "total_scale": 1.0,
+}
+
+# Postseason overrides. October baseball differs structurally from the regular
+# season: starters get a quick hook (shorter innings -> more bullpen), off-days
+# keep pens fresh (fatigue penalty softened), and only the best few relievers
+# actually pitch (leverage usage). These are PRINCIPLED structural shifts, not
+# fit to playoff results — ~35 games/yr is far too small to tune on.
+PLAYOFF_CFG = {
+    **DEFAULT_CFG,
+    "sp_ip_mult": 0.82,      # ~5.9 IP starter -> ~4.8 in a playoff game
+    "pen_fresh_boost": 0.5,  # halve the fatigue penalty (series have off-days)
+    "pen_top_heavy": True,   # only the top arms see the mound
+    "pen_top_n": 5,
 }
 
 
@@ -355,23 +373,27 @@ def usage_weight(role):
     return USAGE_WEIGHT.get(role, 1.0)
 
 
-def bullpen_run_prevention(arms, lg_era):
+def bullpen_run_prevention(arms, lg_era, top_heavy=False, top_n=5):
     """
     Bullpen run-prevention = average reliever TRUE TALENT weighted by
     AVAILABILITY x EXPECTED USAGE.
 
         arms: list of {"talent": ra_per9, "avail": 0..1, "usage": >0}
     (avail/usage default to 1.0 so simpler callers still work.)
+
+    top_heavy (playoffs): mop-up arms never pitch — keep only the best `top_n`
+    arms by talent, so the estimate reflects the leverage relievers a team
+    actually rides in October.
     """
-    if not arms:
+    pool = [a for a in arms if a.get("talent") is not None]
+    if not pool:
         return lg_era + 0.20
+    if top_heavy and len(pool) > top_n:
+        pool = sorted(pool, key=lambda a: a["talent"])[:top_n]  # best (lowest RA/9)
     num = den = 0.0
-    for a in arms:
-        t = a.get("talent")
-        if t is None:
-            continue
+    for a in pool:
         w = a.get("avail", 1.0) * a.get("usage", 1.0)
-        num += t * w
+        num += a["talent"] * w
         den += w
     return num / den if den else lg_era + 0.20
 
@@ -436,8 +458,8 @@ def _project_ip(ip, gs, cfg):
     except (TypeError, ValueError):
         return 4.5
     if gs <= 0:
-        return 4.5
-    return min(hi, max(lo, ip / gs))
+        return 4.5 * cfg.get("sp_ip_mult", 1.0)
+    return min(hi, max(lo, (ip / gs) * cfg.get("sp_ip_mult", 1.0)))
 
 
 def team_def_ra(feat, lg_r, cfg):
